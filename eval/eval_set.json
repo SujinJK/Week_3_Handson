@@ -1,0 +1,34 @@
+[
+  {
+    "question": "How many days of PTO carry over into the next year?",
+    "expected_source": "employee_handbook.md"
+  },
+  {
+    "question": "What MFA methods are approved for production system access?",
+    "expected_source": "security_policy.md"
+  },
+  {
+    "question": "How long are deleted files kept in Trash before they're gone for good?",
+    "expected_source": "product_faq.md"
+  },
+  {
+    "question": "If I'm charged twice by mistake, how do I get my money back?",
+    "expected_source": "refund_policy.md"
+  },
+  {
+    "question": "How quickly does the on-call engineer need to acknowledge a page?",
+    "expected_source": "incident_runbook.md"
+  },
+  {
+    "question": "Can I still work remotely if I want to be fully remote all the time?",
+    "expected_source": "employee_handbook.md"
+  },
+  {
+    "question": "What happens if I downgrade my plan and go over the new storage limit?",
+    "expected_source": "product_faq.md"
+  },
+  {
+    "question": "Who needs to approve access to Tier 3 restricted data?",
+    "expected_source": "security_policy.md"
+  }
+]
