@@ -19,6 +19,8 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
 def build_collection() -> chromadb.Collection:
+    """Rebuild the Chroma collection from scratch: read every corpus/*.md file, chunk it,
+    embed each chunk locally, and store it with its source filename as metadata."""
     client = chromadb.PersistentClient(path=str(DB_DIR))
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL
@@ -44,6 +46,7 @@ def build_collection() -> chromadb.Collection:
 
 
 def main() -> None:
+    """Entry point for `python ingest.py` — builds the collection and reports how many chunks landed in it."""
     collection = build_collection()
     print(f"Ingested {collection.count()} chunks from {CORPUS_DIR} into {DB_DIR}")
 

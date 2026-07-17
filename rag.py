@@ -32,6 +32,8 @@ SYSTEM_PROMPT = (
 
 
 def get_collection() -> chromadb.Collection:
+    """Open the Chroma collection built by ingest.py. Must use the same embedding
+    model as ingestion, or query vectors won't be comparable to the stored ones."""
     client = chromadb.PersistentClient(path=str(DB_DIR))
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL
@@ -56,6 +58,8 @@ def retrieve(collection: chromadb.Collection, question: str, k: int = 3) -> list
 
 
 def build_context_block(hits: list[dict]) -> str:
+    """Format retrieved chunks as numbered, source-labeled blocks Claude can cite by number
+    (e.g. "[1]"), and a human can trace back to the exact source file afterward."""
     parts = []
     for i, hit in enumerate(hits, start=1):
         parts.append(f"[{i}] (source: {hit['source']})\n{hit['text']}")
@@ -63,6 +67,9 @@ def build_context_block(hits: list[dict]) -> str:
 
 
 def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection, question: str) -> None:
+    """Run one full RAG turn for a single question: retrieve chunks, ask Claude to
+    answer strictly from them, then print the answer alongside what was retrieved
+    so a human can verify the citations against the actual source chunks."""
     hits = retrieve(collection, question)
     context = build_context_block(hits)
 
@@ -81,6 +88,7 @@ def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection
 
 
 def main() -> None:
+    """Entry point for `python rag.py` — the interactive question loop."""
     if not pathlib.Path(DB_DIR).exists():
         print("No vector store found. Run `python ingest.py` first.")
         return
