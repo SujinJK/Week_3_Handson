@@ -57,6 +57,39 @@ python -m eval.retrieval_eval   # measure retrieval quality (free, no API calls)
 pytest                     # unit tests for chunking
 ```
 
+## Things to be aware of
+
+- **Run order matters.** `rag.py` refuses to start ("No vector store found")
+  until `ingest.py` has been run at least once.
+- **`ingest.py` rebuilds from scratch every run** — it deletes and recreates
+  the collection, so there's no incremental update. Re-run it after editing
+  anything in `corpus/`.
+- **`chroma_db/` is gitignored on purpose** — it's a local binary database,
+  not source. Anyone who clones this repo (including you, on another
+  machine) needs to run `ingest.py` once before `rag.py` will work.
+- **Retrieval is free; only generation costs money.** Embeddings run
+  entirely on your machine, no API calls — re-run `ingest.py` and
+  `eval/retrieval_eval.py` as often as you want at zero cost. Only `rag.py`'s
+  Claude call spends API credit, and it's small (short context, short
+  answer).
+- **`rag.py` has no conversation memory.** Unlike a chatbot, each question is
+  answered independently with no history carried between turns — deliberate,
+  to keep retrieval/citation behavior easy to reason about in isolation.
+- **The corpus is intentionally tiny** (5 docs, 10 chunks) — enough to prove
+  the pipeline works and to run a fast eval loop, but not representative of
+  retrieval quality at real scale.
+- **Embedding quality ceiling.** Local `all-MiniLM-L6-v2` performs well here
+  (8/8 on the eval) because the corpus is small and topically distinct.
+  Voyage AI (Anthropic's recommended embeddings provider) would generally do
+  better on a larger, more ambiguous corpus — worth comparing if this grows.
+- **Local environment note:** on this machine, dependencies are installed in
+  a dedicated virtual environment at `C:\pyenvs\week3` (not the default
+  Python) to work around a Windows path-length limit — see the Windows note
+  above. Activate it (`C:\pyenvs\week3\Scripts\activate`) or call
+  `C:/pyenvs/week3/Scripts/python.exe` directly when running any script here.
+- **Never commit `.env`** — it holds your real `ANTHROPIC_API_KEY`. It's
+  gitignored; only `.env.example` (a placeholder) is tracked.
+
 ## Embeddings and vector similarity
 
 Each chunk of text is converted into a vector (384 numbers, from the
