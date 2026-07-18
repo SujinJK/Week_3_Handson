@@ -96,12 +96,20 @@ Each chunk of text is converted into a vector (384 numbers, from the
 `all-MiniLM-L6-v2` model) that captures its meaning — chunks about similar
 topics end up as vectors that point in similar directions. A question is
 embedded the same way, and Chroma finds the stored chunks whose vectors are
-**closest** to the question's vector (cosine distance — lower means more
-similar). That's the entire "search" step: no keyword matching, so a
-question phrased differently from the source text can still retrieve it.
+**closest** to the question's vector — lower distance means more similar.
+That's the entire "search" step: no keyword matching, so a question phrased
+differently from the source text can still retrieve it.
 
-**What we tuned and why it matters:**
-- **Chunk size (120 words) and overlap (30 words)** in `chunking.py` — too
+**Parameters used, and where they live:**
+- **Distance metric: squared L2 (Euclidean), not cosine.** `ingest.py`
+  creates the Chroma collection without setting `metadata={"hnsw:space":
+  ...}`, so it falls back to Chroma's default, which is `"l2"` — not
+  `"cosine"` as an earlier version of this README incorrectly stated. For
+  normalized embeddings (which `all-MiniLM-L6-v2` produces) the two metrics
+  rank results identically, so retrieval quality is unaffected here, but the
+  raw distance *numbers* printed by `rag.py` are squared-L2 values, not
+  cosine similarity scores — don't read them as "0 to 1."
+- **`chunk_size=120`, `overlap=30` words** in `chunking.py` — too
   large and irrelevant text dilutes the embedding, drowning out the specific
   fact being asked about; too small and a chunk loses the surrounding
   sentence that explains it. Overlap prevents an answer from being split
@@ -110,6 +118,33 @@ question phrased differently from the source text can still retrieve it.
   very likely included even if it's not the single closest match, without
   flooding Claude's context with irrelevant chunks that could get cited by
   mistake.
+- **Embedding model: `all-MiniLM-L6-v2`** (384 dimensions) — a small,
+  general-purpose local model. Fine for this corpus's size and topic
+  separation; a larger or more specialized corpus would likely benefit from
+  a stronger model (e.g. Voyage AI's models).
+- **`temperature` / `top_p` — not set, and not applicable here.** These are
+  text-*generation* sampling knobs (how much randomness the model uses when
+  writing its answer), unrelated to retrieval's `top_k`. They're easy to
+  confuse because both have "top" in the name. We don't set them because
+  `claude-opus-4-8` (used in `rag.py`) doesn't accept them at all — Anthropic
+  removed sampling parameters starting with the 4.6 model generation in
+  favor of an `effort` level, which we also leave at its default.
+
+**What a production RAG system would add that this one doesn't:**
+- **Reranking** — a second-stage model that re-scores the top ~20 vector
+  search results for relevance before picking the final k, catching cases
+  where the fast vector search's top-3 isn't actually the best 3.
+- **Hybrid search** — combining vector similarity with old-fashioned keyword
+  search (e.g. BM25), since embeddings can miss exact matches like product
+  codes, ticket IDs, or specific terminology.
+- **Query transformation** — rewriting or expanding the user's question
+  before embedding it, to bridge cases where the question's wording is very
+  different from the document's wording.
+
+We skipped all three deliberately — the corpus is small and clean enough
+that plain vector search already hits 8/8 on the eval set, so adding them
+here would be complexity without a measurable benefit. They become worth it
+as the corpus grows or gets noisier.
 
 ## How RAG fails (and how this project detects each)
 
