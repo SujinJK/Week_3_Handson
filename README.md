@@ -149,6 +149,33 @@ that plain vector search already hits 8/8 on the eval set, so adding them
 here would be complexity without a measurable benefit. They become worth it
 as the corpus grows or gets noisier.
 
+## Challenges RAG systems face at scale (beyond what this project shows)
+
+This project is small and clean on purpose, so it doesn't hit every
+challenge a production RAG system runs into. Worth knowing about even
+though nothing here demonstrates them directly:
+
+- **Keeping the index fresh.** If source documents change, the vector store
+  goes stale until someone re-runs ingestion — at scale, "when and how do we
+  re-embed changed documents" becomes its own pipeline, not a one-off script
+  like `ingest.py`.
+- **Evaluating quality is hard.** "Did retrieval find the right thing?" and
+  "did generation answer well?" are different questions that need separate
+  measurement (this is why `eval/retrieval_eval.py` deliberately tests
+  retrieval alone) — and at real scale, building and maintaining a
+  representative eval set is itself an ongoing project, not an 8-question
+  file.
+- **Cost and latency compound.** Every question costs an embedding call, a
+  vector search, and a generation call. Add reranking or query
+  transformation and that's more calls per question. At production volume,
+  vector database hosting and embedding costs add up alongside the
+  generation cost.
+- **Access control.** This project pools every document into one searchable
+  index. A real company has documents only some people should be able to
+  retrieve (HR files vs. public docs) — plain RAG doesn't handle that by
+  default; permission filtering has to be built in deliberately, typically
+  by tagging chunks with access metadata and filtering at query time.
+
 ## How RAG fails (and how this project detects each)
 
 1. **Retrieval miss** — the right document exists but doesn't get retrieved
@@ -231,6 +258,40 @@ a capable model) can catch and soften some retrieval-layer problems, but it
 is a safety net, not a fix. The underlying issues — no relevance threshold,
 chunk boundaries splitting facts, no document lifecycle management — live in
 the retrieval layer and have to be solved there.
+
+## Terminology: what we used vs. what we skipped
+
+**Used in this project:**
+
+| Term | What it means | Where |
+|---|---|---|
+| Chunking | Splitting a document into smaller, searchable pieces | `chunking.py` |
+| Embedding | Converting text into a vector of numbers that captures its meaning | `ingest.py`, `rag.py` (local, `all-MiniLM-L6-v2`) |
+| Vector store / vector database | A database built to search by vector similarity, not exact match | Chroma (`chroma_db/`) |
+| Persistent (vs. in-memory) store | The vector store is saved to disk and survives between runs | `chromadb.PersistentClient` |
+| Similarity search / nearest-neighbor search | Finding the stored vectors closest to a query vector | `collection.query(...)` |
+| Distance metric | The math used to measure "closeness" between two vectors | squared L2 (Chroma's default here) |
+| `top_k` (we call it `k`) | How many of the closest results to retrieve | `k=3` in `rag.py` |
+| Grounding | Restricting the model to answer only from retrieved content | `SYSTEM_PROMPT` in `rag.py` |
+| Citations | Tagging each claim with which source it came from | `[1]`-style citations in answers |
+| System prompt | The instruction that sets the model's behavior for the whole request | `SYSTEM_PROMPT` |
+| Hallucination (as a failure mode we test for) | The model answering from outside knowledge instead of the given context | tested by the "CEO's favorite language" case and `failure_demos.py` demo 1 |
+| Retrieval evaluation / hit@k | Measuring whether the right document was retrieved, separate from answer quality | `eval/retrieval_eval.py` |
+
+**Standard RAG techniques we deliberately skipped** (see "What a production
+RAG system would add" and "Challenges RAG systems face at scale" above for
+why each matters and when it'd be worth adding):
+
+| Term | What it means | Why we skipped it here |
+|---|---|---|
+| Reranking | A second-stage model that re-scores initial results for relevance | Corpus is small and clean enough that plain vector search already hits 8/8 on the eval |
+| Hybrid search | Combining vector similarity with keyword search (e.g. BM25) | No exact-match terms (IDs, codes) in this corpus that vector search would miss |
+| Query transformation / expansion / HyDE | Rewriting the question before embedding it to better match document phrasing | Questions in the eval set were already phrased close enough to the source text |
+| `temperature` / `top_p` | Generation-time randomness controls (unrelated to retrieval's `top_k`, despite the similar name) | Not accepted at all by `claude-opus-4-8` — Anthropic replaced them with `effort` on recent models |
+| Semantic chunking | Splitting on sentence/paragraph boundaries instead of a fixed word count | Fixed-size chunking with overlap was simpler and sufficient for this corpus; demo 2 in `failure_demos.py` shows exactly the failure semantic chunking would help avoid |
+| Access control / permission-filtered retrieval | Restricting which documents a given user's queries can retrieve | Single-user demo corpus with no real permission boundaries to enforce |
+| Incremental indexing | Updating the vector store for changed documents only, instead of a full rebuild | `ingest.py` rebuilds from scratch every run — fine at 5 documents, not at scale |
+| Agentic / multi-hop RAG | The model deciding whether/what to retrieve, and issuing further retrievals based on what it finds | Every question here is answered in a single retrieve-then-generate pass |
 
 ## Test cases
 
