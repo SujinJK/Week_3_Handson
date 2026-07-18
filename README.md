@@ -25,9 +25,11 @@ no API calls, no cost. Only the final answer-generation step calls Claude.
 | File | Purpose |
 |---|---|
 | `corpus/*.md` | 5 sample "company knowledge base" documents (HR, security, product, billing, incidents) — deliberately on different topics so retrieval quality is testable. |
+| `corpus_conflict_demo/*.md` | A copy of `corpus/` plus one extra, undated, superseded employee handbook with a different PTO policy — used only by `failure_demos.py` to demonstrate the conflicting/stale-document failure. Never touched by `ingest.py`. |
 | `chunking.py` | Splits document text into overlapping word-count chunks. Pure Python, no dependencies — easy to unit test. |
 | `ingest.py` | Loads `corpus/`, chunks each file, embeds chunks with a local model, stores them in a persistent Chroma collection (`chroma_db/`). |
 | `rag.py` | The Q&A app: embeds the question, retrieves the top-k most similar chunks, sends them to Claude as context, prints the cited answer and which chunks were retrieved. |
+| `failure_demos.py` | Deliberately triggers 3 real RAG failure modes live against the API, using disposable temporary Chroma collections — see "Failure demos" below. |
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
 | `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free) and reports hit@k — did the right document get retrieved? |
 | `tests/test_chunking.py` | Unit tests for the chunking logic (chunk boundaries, overlap, no data loss). |
@@ -54,6 +56,7 @@ extensions need a current C++ runtime.
 python ingest.py          # build the vector store (run once, or whenever corpus/ changes)
 python rag.py              # interactive Q&A loop
 python -m eval.retrieval_eval   # measure retrieval quality (free, no API calls)
+python failure_demos.py   # watch 3 real RAG failure modes happen live
 pytest                     # unit tests for chunking
 ```
 
@@ -168,6 +171,66 @@ as the corpus grows or gets noisier.
    automatable by asking a second Claude call to verify each cited claim
    against its source chunk (not implemented here, but the natural next
    step if this were a production system).
+
+## Failure demos — `failure_demos.py`
+
+Reading about failure modes is one thing; watching the pipeline actually
+produce them is more convincing. This script deliberately breaks the
+pipeline three different ways, live against the real API, using temporary
+Chroma collections that never touch `chroma_db/` (the real pipeline's
+store).
+
+```
+python failure_demos.py
+```
+
+**What actually happened when we ran it** (real transcripts, not
+hypothetical):
+
+**1. Retrieval has no "nothing is relevant" signal.** Asked
+`"What is Nimbus's uptime SLA guarantee percentage?"` — a topic the corpus
+never covers at all. Retrieval didn't refuse or come back empty; it
+confidently returned its 3 *closest* chunks anyway (from `refund_policy.md`
+and `incident_runbook.md`, neither relevant). Nearest-neighbor search always
+returns *something* — "closest available" is not the same as "actually
+relevant," and there's no default similarity threshold to catch the
+difference. Whether a bad answer gets through from there is entirely down to
+generation refusing to use context that doesn't fit — which is exactly what
+our grounded system prompt is for. (In this run, Claude Opus refused
+correctly with both a weak and a strict prompt — a genuinely good result,
+not a failed demo. It just means this particular question wasn't enough to
+trip up this particular model; the retrieval blind spot underneath it is
+still real, and weaker models or trickier questions can and do fall through
+it.)
+
+**2. Chunking can fragment a fact away from itself.** The sentence "Nimbus
+issues a **full refund** ... within **5 business days**" got fed through a
+deliberately broken chunker (8-word chunks, no overlap). The retrieved
+fragment was just `"charge within 5 business days of the report"` — missing
+"full refund" entirely. Claude still recovered the number correctly, purely
+by luck of where the boundary happened to fall; a slightly different chunk
+size could easily have cut the fragment before "5 business days" instead,
+losing the answer entirely. Real degradation, not always a *visible* one.
+
+**3. Conflicting/stale documents produce the most dangerous failure of the
+three.** We added a second, undated employee handbook with a different
+(superseded) PTO policy — nothing marks it as outdated, exactly like a real
+stale file nobody deleted. At **k=1** (retrieve only the single closest
+chunk), the stale document happened to rank *closer* than the current one,
+so the system returned: *"Unused PTO carries over up to a maximum of 10
+days... [1]"* — cleanly cited, confidently worded, and **wrong**. Nothing
+about that answer looks uncertain; that's what makes it the worst kind of
+failure. At **k=3**, both versions get retrieved, and Claude noticed the
+contradiction on its own and flagged it ("these two sources disagree,
+confirm with HR") instead of picking one — a much better outcome, but one
+that depends entirely on generation catching a problem retrieval should
+never have surfaced unresolved.
+
+**The pattern across all three:** generation quality (a good system prompt,
+a capable model) can catch and soften some retrieval-layer problems, but it
+is a safety net, not a fix. The underlying issues — no relevance threshold,
+chunk boundaries splitting facts, no document lifecycle management — live in
+the retrieval layer and have to be solved there.
 
 ## Test cases
 
