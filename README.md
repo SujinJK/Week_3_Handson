@@ -149,6 +149,47 @@ that plain vector search already hits 8/8 on the eval set, so adding them
 here would be complexity without a measurable benefit. They become worth it
 as the corpus grows or gets noisier.
 
+## Evaluation metrics
+
+**Metric used: Hit@k (retrieval recall at k).** For each question in
+`eval/eval_set.json`, checks whether the expected source document appears
+anywhere among the top-k retrieved chunks. Hit@k = (questions where the
+right document was found) / (total questions).
+
+```
+python -m eval.retrieval_eval
+```
+
+- **k = 3**, matching `rag.py`'s retrieval setting.
+- **Current score: 8/8 (100%)** on the 8-question eval set.
+- **No API calls, so it's free** — this only exercises retrieval, not
+  generation.
+
+**Why hit@k, and its limitation:** it's the simplest metric that answers
+"is retrieval broken?" in isolation from generation quality — necessary
+because `eval/retrieval_eval.py` deliberately never calls Claude (see "How
+RAG fails" below, failure mode #1). Its main weakness is that it's
+**rank-blind**: a correct document retrieved as chunk #1 scores identically
+to one retrieved as chunk #3. A rank-aware metric like Mean Reciprocal Rank
+(MRR) or NDCG would additionally reward retrieving the right chunk *higher*,
+which hit@k can't distinguish. Not needed at this corpus size, but a real
+gap if the corpus grew.
+
+**What we did NOT measure — generation-quality metrics:**
+
+| Metric | What it would check | Status |
+|---|---|---|
+| Faithfulness / groundedness | Does the answer only use retrieved content, with nothing added from outside knowledge? | Not scored — `failure_demos.py` demo 1 tests this qualitatively (does the model refuse to extrapolate), but produces no number |
+| Citation accuracy | Does citation `[1]` actually support the claim next to it? | Not scored — README's "How RAG fails" #3 notes this is checked manually, and describes (but doesn't implement) an automatable check via a second Claude call |
+| Answer correctness | Is the final answer actually right? | Not scored — checked manually during live runs, no automated ground-truth comparison |
+
+Tools like RAGAS (an open-source RAG evaluation library) automate all three
+via an LLM-as-judge approach. We didn't reach for one here — hit@k was
+enough to validate the retrieval layer, and the failure demos cover
+generation-layer risk qualitatively instead of quantitatively. Adding
+automated generation scoring is the natural next step if this project grew
+past a course exercise.
+
 ## Challenges RAG systems face at scale (beyond what this project shows)
 
 This project is small and clean on purpose, so it doesn't hit every
