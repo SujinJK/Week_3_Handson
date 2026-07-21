@@ -32,6 +32,7 @@ no API calls, no cost. Only the final answer-generation step calls Claude.
 | `failure_demos.py` | Deliberately triggers 3 real RAG failure modes live against the API, using disposable temporary Chroma collections — see "Failure demos" below. |
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
 | `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free) and reports hit@k — did the right document get retrieved? |
+| `eval/generation_eval.py` | Runs the full pipeline (retrieve + generate) for every eval question, then uses a second Claude call as an LLM-as-judge to score faithfulness and citation accuracy. Costs a small amount of API credit — see "Evaluation metrics" below. |
 | `tests/test_chunking.py` | Unit tests for the chunking logic (chunk boundaries, overlap, no data loss). |
 | `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`) / test deps (`pytest`). |
 | `.env.example` / `.env` | API key template / your real key (gitignored). |
@@ -55,7 +56,8 @@ extensions need a current C++ runtime.
 ```
 python ingest.py          # build the vector store (run once, or whenever corpus/ changes)
 python rag.py              # interactive Q&A loop
-python -m eval.retrieval_eval   # measure retrieval quality (free, no API calls)
+python -m eval.retrieval_eval    # measure retrieval quality (free, no API calls)
+python -m eval.generation_eval   # measure answer faithfulness + citation accuracy (small API cost)
 python failure_demos.py   # watch 3 real RAG failure modes happen live
 pytest                     # unit tests for chunking
 ```
@@ -70,11 +72,12 @@ pytest                     # unit tests for chunking
 - **`chroma_db/` is gitignored on purpose** — it's a local binary database,
   not source. Anyone who clones this repo (including you, on another
   machine) needs to run `ingest.py` once before `rag.py` will work.
-- **Retrieval is free; only generation costs money.** Embeddings run
-  entirely on your machine, no API calls — re-run `ingest.py` and
-  `eval/retrieval_eval.py` as often as you want at zero cost. Only `rag.py`'s
-  Claude call spends API credit, and it's small (short context, short
-  answer).
+- **Retrieval is free; generation costs money.** Embeddings run entirely on
+  your machine, no API calls — re-run `ingest.py` and
+  `eval/retrieval_eval.py` as often as you want at zero cost. `rag.py` and
+  `eval/generation_eval.py` both call Claude and spend API credit; the
+  latter calls it *twice* per question (generate, then judge), so it's the
+  priciest thing to re-run here — still small, but not free like the rest.
 - **`rag.py` has no conversation memory.** Unlike a chatbot, each question is
   answered independently with no history carried between turns — deliberate,
   to keep retrieval/citation behavior easy to reason about in isolation.
@@ -184,20 +187,43 @@ to one retrieved as chunk #3. A rank-aware metric like Mean Reciprocal Rank
 which hit@k can't distinguish. Not needed at this corpus size, but a real
 gap if the corpus grew.
 
-**What we did NOT measure — generation-quality metrics:**
+**Generation-quality metrics: `eval/generation_eval.py`.** Runs the real
+pipeline end-to-end (retrieve + generate) for each eval question, then uses
+a second Claude call as an "LLM-as-judge" to grade the answer:
 
-| Metric | What it would check | Status |
-|---|---|---|
-| Faithfulness / groundedness | Does the answer only use retrieved content, with nothing added from outside knowledge? | Not scored — `failure_demos.py` demo 1 tests this qualitatively (does the model refuse to extrapolate), but produces no number |
-| Citation accuracy | Does citation `[1]` actually support the claim next to it? | Not scored — README's "How RAG fails" #3 notes this is checked manually, and describes (but doesn't implement) an automatable check via a second Claude call |
-| Answer correctness | Is the final answer actually right? | Not scored — checked manually during live runs, no automated ground-truth comparison |
+```
+python -m eval.generation_eval
+```
 
-Tools like RAGAS (an open-source RAG evaluation library) automate all three
-via an LLM-as-judge approach. We didn't reach for one here — hit@k was
-enough to validate the retrieval layer, and the failure demos cover
-generation-layer risk qualitatively instead of quantitatively. Adding
-automated generation scoring is the natural next step if this project grew
-past a course exercise.
+- **Faithfulness** — does the answer use only what the retrieved context
+  actually supports, with nothing added from outside knowledge? An honest
+  "I don't have enough information" always counts as faithful.
+- **Citation accuracy** — for every `[N]` citation in the answer, does
+  snippet N actually support the specific claim next to it?
+- **Current score: 8/8 (100%) on both**, using a structured-output judge
+  (`output_config.format` with a JSON schema for `faithful` /
+  `citations_valid` / `explanation`) so the verdict is reliably parseable
+  rather than free-text.
+- **Not free** — unlike `eval/retrieval_eval.py`, this calls Claude twice
+  per question (generate, then judge), so re-running it costs a small
+  amount of API credit.
+- **A judge is not ground truth.** The judge is itself an LLM call, so it
+  can be wrong or inconsistent — this measures "does a careful reader
+  agree the answer is grounded," not an objective, unimpeachable score.
+  Spot-checking a few of its verdicts by hand is still worthwhile before
+  trusting it at scale.
+
+**Still not measured: answer correctness** — is the final answer actually
+*right*, independent of whether it's grounded in the context? That needs
+hand-written reference answers to compare against (we only have
+`expected_source`, not `expected_answer`, in `eval_set.json`), which is
+real additional effort to build and maintain — the natural next step if
+this eval set grew.
+
+Tools like RAGAS (an open-source RAG evaluation library) automate
+faithfulness and citation-style checks the same way, plus more. We built
+our own here instead of adopting a framework, since a single-purpose judge
+prompt was enough for an 8-question eval set.
 
 ## Challenges RAG systems face at scale (beyond what this project shows)
 
@@ -243,11 +269,10 @@ though nothing here demonstrates them directly:
    happening, generation is hallucinating.
 3. **Wrong or missing citations** — the answer is correct but doesn't cite
    the chunk it came from, or cites the wrong one, so a human can't verify
-   it. *Detected by:* manually spot-checking that each citation number in
-   the printed answer matches a source that actually supports that claim —
-   automatable by asking a second Claude call to verify each cited claim
-   against its source chunk (not implemented here, but the natural next
-   step if this were a production system).
+   it. *Detected by:* `eval/generation_eval.py` — a second Claude call
+   (LLM-as-judge) checks every citation against its source chunk and scores
+   `citations_valid` per question (currently 8/8). Not infallible — the
+   judge is itself an LLM call — but no longer purely manual.
 
 ## Failure demos — `failure_demos.py`
 
@@ -341,6 +366,7 @@ describing the fix.
 | Hallucination (as a failure mode we test for) | The model answering from outside knowledge instead of the given context | tested by the "CEO's favorite language" case and `failure_demos.py` demo 1 |
 | Retrieval evaluation / hit@k | Measuring whether the right document was retrieved, separate from answer quality | `eval/retrieval_eval.py` |
 | Metadata filtering | Restricting *which* chunks a query searches over, using stored metadata, before similarity ranking happens | `where={"status": "current"}` in `retrieve()` (`rag.py`); every real chunk is tagged `"current"` so it's a no-op today — `failure_demos.py` demo 3 shows it actually excluding a stale document when one exists |
+| LLM-as-judge | Using a separate LLM call to grade another LLM call's output against a rubric, instead of grading by hand | `eval/generation_eval.py`'s `judge_answer()` — grades faithfulness and citation accuracy using `output_config.format` for a reliably parseable verdict |
 
 **Standard RAG techniques we deliberately skipped** (see "What a production
 RAG system would add" and "Challenges RAG systems face at scale" above for

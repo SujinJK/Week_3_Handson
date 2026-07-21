@@ -72,6 +72,22 @@ def build_context_block(hits: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+def generate_answer(client: anthropic.Anthropic, hits: list[dict], question: str) -> str:
+    """Ask Claude to answer strictly from the given retrieved chunks. Returns the answer text.
+
+    Split out from answer_question() so eval scripts can generate a real
+    answer through the same code path the interactive app uses, instead of
+    duplicating the Claude call."""
+    context = build_context_block(hits)
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
+    )
+    return next(b.text for b in response.content if b.type == "text")
+
+
 def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection, question: str) -> None:
     """Run one full RAG turn for a single question: retrieve chunks, ask Claude to
     answer strictly from them, then print the answer alongside what was retrieved
@@ -81,15 +97,7 @@ def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection
     # here so a future superseded document is excluded by construction rather
     # than relying on generation to notice the conflict after the fact.
     hits = retrieve(collection, question, where={"status": "current"})
-    context = build_context_block(hits)
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
-    )
-    answer = next(b.text for b in response.content if b.type == "text")
+    answer = generate_answer(client, hits, question)
 
     print(f"\n{answer}\n")
     print("Sources retrieved:")
