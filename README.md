@@ -11,14 +11,18 @@ knowledge.
 corpus/*.md --chunk--> chunking.py --embed (local)--> ingest.py --store--> Chroma
                                                                               |
                                                                               v
-                                          question --embed (local)--> retrieve top-k
+                                    question --embed (local)--> retrieve top-8 (vector search)
+                                                                              |
+                                                                              v
+                                                    rerank (local cross-encoder) --> top-3
                                                                               |
                                                                               v
                                                           Claude (generate, cite sources)
 ```
 
-Retrieval (chunking, embedding, vector search) is entirely local and free —
-no API calls, no cost. Only the final answer-generation step calls Claude.
+Retrieval, reranking, chunking, and embedding are all entirely local and
+free — no API calls, no cost. Only the final answer-generation step calls
+Claude.
 
 ## Project structure
 
@@ -28,10 +32,10 @@ no API calls, no cost. Only the final answer-generation step calls Claude.
 | `corpus_conflict_demo/*.md` | A copy of `corpus/` plus one extra, undated, superseded employee handbook with a different PTO policy — used only by `failure_demos.py` to demonstrate the conflicting/stale-document failure. Never touched by `ingest.py`. |
 | `chunking.py` | Two chunkers: `chunk_text` (fixed word-count, can split a sentence mid-way) and `semantic_chunk_text` (groups whole sentences up to a target size, never splitting one). Pure Python, no dependencies — easy to unit test. |
 | `ingest.py` | Loads `corpus/`, chunks each file with `semantic_chunk_text`, embeds chunks with a local model, stores them in a persistent Chroma collection (`chroma_db/`). |
-| `rag.py` | The Q&A app: embeds the question, retrieves the top-k most similar chunks, sends them to Claude as context, prints the cited answer and which chunks were retrieved. |
+| `rag.py` | The Q&A app: retrieves a wide candidate pool by vector similarity, reranks it with a local cross-encoder, sends the final chunks to Claude as context, and prints the cited answer alongside both retrieval stages so you can see what the reranker kept vs. discarded. |
 | `failure_demos.py` | Deliberately triggers 3 real RAG failure modes live against the API, using disposable temporary Chroma collections — see "Failure demos" below. |
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
-| `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free) and reports hit@k — did the right document get retrieved? |
+| `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free), comparing plain vector search hit@k against hit@k after reranking. |
 | `eval/generation_eval.py` | Runs the full pipeline (retrieve + generate) for every eval question, then uses a second Claude call as an LLM-as-judge to score faithfulness and citation accuracy. Costs a small amount of API credit — see "Evaluation metrics" below. |
 | `tests/test_chunking.py` | Unit tests for the chunking logic (chunk boundaries, overlap, no data loss). |
 | `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`) / test deps (`pytest`). |
@@ -72,6 +76,10 @@ pytest                     # unit tests for chunking
 - **`chroma_db/` is gitignored on purpose** — it's a local binary database,
   not source. Anyone who clones this repo (including you, on another
   machine) needs to run `ingest.py` once before `rag.py` will work.
+- **First run downloads a second local model.** Alongside the embedding
+  model, `rag.py`'s reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`)
+  downloads from Hugging Face the first time `rerank()` runs — a one-time
+  cost, cached afterward, no API key or cost involved.
 - **Retrieval is free; generation costs money.** Embeddings run entirely on
   your machine, no API calls — re-run `ingest.py` and
   `eval/retrieval_eval.py` as often as you want at zero cost. `rag.py` and
@@ -124,10 +132,14 @@ differently from the source text can still retrieve it.
   respect sentence structure — there's no "cut mid-sentence" case left for
   it to compensate for. `failure_demos.py` demo 2 shows this holding even at
   a 15-word target, far smaller than the sentence it needs to keep whole.
-- **k=3** retrieved chunks per question — enough that the right chunk is
-  very likely included even if it's not the single closest match, without
-  flooding Claude's context with irrelevant chunks that could get cited by
-  mistake.
+- **Two-stage retrieval: `INITIAL_K=8` vector candidates, reranked down to
+  `FINAL_K=3`.** `retrieve()` pulls the 8 closest chunks by vector distance;
+  `rerank()` then re-scores all 8 with a local cross-encoder
+  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) and keeps the top 3 by that score.
+  A cross-encoder reads the question and each chunk *together*, so it can
+  catch relevance a bi-encoder's independently-computed embeddings miss —
+  see "Evaluation metrics" below for a real case where it reordered the
+  top result. Runs locally, same as embedding — no added API cost.
 - **Embedding model: `all-MiniLM-L6-v2`** (384 dimensions) — a small,
   general-purpose local model. Fine for this corpus's size and topic
   separation; a larger or more specialized corpus would likely benefit from
@@ -149,10 +161,7 @@ differently from the source text can still retrieve it.
   without deleting the file or touching the ingest pipeline. See "Failure
   demos" below for this actually fixing the stale-document problem.
 
-**What a production RAG system would add that this one doesn't:**
-- **Reranking** — a second-stage model that re-scores the top ~20 vector
-  search results for relevance before picking the final k, catching cases
-  where the fast vector search's top-3 isn't actually the best 3.
+**What a production RAG system would add that this one still doesn't:**
 - **Hybrid search** — combining vector similarity with old-fashioned keyword
   search (e.g. BM25), since embeddings can miss exact matches like product
   codes, ticket IDs, or specific terminology.
@@ -160,10 +169,12 @@ differently from the source text can still retrieve it.
   before embedding it, to bridge cases where the question's wording is very
   different from the document's wording.
 
-We skipped all three deliberately — the corpus is small and clean enough
-that plain vector search already hits 8/8 on the eval set, so adding them
-here would be complexity without a measurable benefit. They become worth it
-as the corpus grows or gets noisier.
+We skipped both deliberately — the corpus is small and clean enough that
+plain vector search already hits 8/8 on the eval set, so adding them here
+would be complexity without a measurable benefit. They become worth it as
+the corpus grows or gets noisier. (Reranking used to be on this list too —
+see "Evaluation metrics" below for why we added it anyway, and the
+"Terminology" table for how it's wired in.)
 
 ## Evaluation metrics
 
@@ -176,8 +187,10 @@ right document was found) / (total questions).
 python -m eval.retrieval_eval
 ```
 
-- **k = 3**, matching `rag.py`'s retrieval setting.
-- **Current score: 8/8 (100%)** on the 8-question eval set.
+- **k = 3**, matching `rag.py`'s final retrieval count.
+- **Current score: 8/8 (100%) both with plain vector search AND after
+  reranking** (retrieve 8, rerank to 3) — reranking didn't change which
+  documents passed on this small, topically-distinct corpus.
 - **No API calls, so it's free** — this only exercises retrieval, not
   generation.
 
@@ -188,8 +201,15 @@ RAG fails" below, failure mode #1). Its main weakness is that it's
 **rank-blind**: a correct document retrieved as chunk #1 scores identically
 to one retrieved as chunk #3. A rank-aware metric like Mean Reciprocal Rank
 (MRR) or NDCG would additionally reward retrieving the right chunk *higher*,
-which hit@k can't distinguish. Not needed at this corpus size, but a real
-gap if the corpus grew.
+which hit@k can't distinguish — and that blindness is exactly why the
+identical 8/8 scores understate reranking's effect here. In the eval run,
+reranking changed the actual *ordering* for 2 of the 8 questions even though
+hit@3 didn't move. `rag.py` shows a clearer case live: for "how long are
+files kept in Trash," vector distance ranked `refund_policy.md` closest
+(0.465) over `product_faq.md` (0.524) — the actually-correct source — but
+the cross-encoder scored them 0.485 vs. **4.466**, correctly promoting
+`product_faq.md` to #1. Hit@3 is blind to this because both chunks were in
+the top 3 either way; an MRR-style metric would have caught the improvement.
 
 **Generation-quality metrics: `eval/generation_eval.py`.** Runs the real
 pipeline end-to-end (retrieve + generate) for each eval question, then uses
@@ -379,6 +399,8 @@ describing the fix.
 | Metadata filtering | Restricting *which* chunks a query searches over, using stored metadata, before similarity ranking happens | `where={"status": "current"}` in `retrieve()` (`rag.py`); every real chunk is tagged `"current"` so it's a no-op today — `failure_demos.py` demo 3 shows it actually excluding a stale document when one exists |
 | LLM-as-judge | Using a separate LLM call to grade another LLM call's output against a rubric, instead of grading by hand | `eval/generation_eval.py`'s `judge_answer()` — grades faithfulness and citation accuracy using `output_config.format` for a reliably parseable verdict |
 | Semantic chunking | Splitting on sentence boundaries and grouping whole sentences up to a target size, instead of a fixed word count | `semantic_chunk_text()` in `chunking.py`, used by `ingest.py`; a chunk boundary only ever falls between sentences, never inside one — `failure_demos.py` demo 2 proves this holds even at a 15-word target far smaller than the sentence it must keep whole |
+| Reranking | A second-stage model that re-scores initial vector-search results, using a slower but more accurate method, before picking the final k | `rerank()` in `rag.py`, using a local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`); retrieves 8 candidates by vector distance, reranks to the final 3 — see "Evaluation metrics" for a real case where this reordered the top result |
+| Bi-encoder vs. cross-encoder | A bi-encoder embeds query and document separately, then compares vectors (fast, used for the initial wide retrieval); a cross-encoder reads both together and scores relevance directly (slower, more accurate, only practical over a small candidate pool) | `all-MiniLM-L6-v2` (bi-encoder, `ingest.py`/`rag.py`'s `retrieve()`) vs. `cross-encoder/ms-marco-MiniLM-L-6-v2` (`rag.py`'s `rerank()`) |
 
 **Standard RAG techniques we deliberately skipped** (see "What a production
 RAG system would add" and "Challenges RAG systems face at scale" above for
@@ -386,7 +408,6 @@ why each matters and when it'd be worth adding):
 
 | Term | What it means | Why we skipped it here |
 |---|---|---|
-| Reranking | A second-stage model that re-scores initial results for relevance | Corpus is small and clean enough that plain vector search already hits 8/8 on the eval |
 | Hybrid search | Combining vector similarity with keyword search (e.g. BM25) | No exact-match terms (IDs, codes) in this corpus that vector search would miss |
 | Query transformation / expansion / HyDE | Rewriting the question before embedding it to better match document phrasing | Questions in the eval set were already phrased close enough to the source text |
 | `temperature` / `top_p` | Generation-time randomness controls (unrelated to retrieval's `top_k`, despite the similar name) | Not accepted at all by `claude-opus-4-8` — Anthropic replaced them with `effort` on recent models |

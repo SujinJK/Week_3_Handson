@@ -19,7 +19,15 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-from rag import MODEL, build_context_block, generate_answer, get_collection, retrieve  # noqa: E402
+from rag import (  # noqa: E402
+    INITIAL_K,
+    MODEL,
+    build_context_block,
+    generate_answer,
+    get_collection,
+    rerank,
+    retrieve,
+)
 
 load_dotenv()
 
@@ -78,7 +86,8 @@ def run_eval(k: int = 3) -> None:
     citations_valid_count = 0
     for case in eval_cases:
         question = case["question"]
-        hits = retrieve(collection, question, k=k, where={"status": "current"})
+        candidates = retrieve(collection, question, k=INITIAL_K, where={"status": "current"})
+        hits = rerank(question, candidates, top_n=k)
         context = build_context_block(hits)
         answer = generate_answer(client, hits, question)
         verdict = judge_answer(client, context, question, answer)

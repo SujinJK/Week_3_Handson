@@ -13,12 +13,20 @@ import anthropic
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
+from sentence_transformers import CrossEncoder
 
 from ingest import COLLECTION_NAME, DB_DIR, EMBEDDING_MODEL
 
 load_dotenv()
 
 MODEL = "claude-opus-4-8"
+
+# Runs entirely on-device, same as the embedding model -- reranking stays free.
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+INITIAL_K = 8  # wider candidate pool handed to the reranker
+FINAL_K = 3    # how many chunks actually reach Claude, after reranking
+
+_reranker: CrossEncoder | None = None
 
 SYSTEM_PROMPT = (
     "You are a support assistant for Nimbus Cloud Storage. Answer the "
@@ -63,6 +71,32 @@ def retrieve(
     return hits
 
 
+def get_reranker() -> CrossEncoder:
+    """Lazily load the local cross-encoder reranker -- only needed once per process."""
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder(RERANKER_MODEL)
+    return _reranker
+
+
+def rerank(question: str, hits: list[dict], top_n: int = FINAL_K) -> list[dict]:
+    """Re-score retrieved hits with a cross-encoder and keep the top_n by that score.
+
+    Vector search (retrieve()) compares independently-computed embeddings --
+    fast, but each chunk's vector is fixed before it ever "sees" the
+    question. A cross-encoder reads the question and each chunk together and
+    produces a more accurate relevance score -- too slow to run over an
+    entire corpus, but cheap over the small candidate pool retrieve() already
+    narrowed things down to. Mutates each hit in place, adding "rerank_score".
+    """
+    reranker = get_reranker()
+    pairs = [(question, hit["text"]) for hit in hits]
+    scores = reranker.predict(pairs)
+    for hit, score in zip(hits, scores):
+        hit["rerank_score"] = float(score)
+    return sorted(hits, key=lambda h: h["rerank_score"], reverse=True)[:top_n]
+
+
 def build_context_block(hits: list[dict]) -> str:
     """Format retrieved chunks as numbered, source-labeled blocks Claude can cite by number
     (e.g. "[1]"), and a human can trace back to the exact source file afterward."""
@@ -89,20 +123,32 @@ def generate_answer(client: anthropic.Anthropic, hits: list[dict], question: str
 
 
 def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection, question: str) -> None:
-    """Run one full RAG turn for a single question: retrieve chunks, ask Claude to
-    answer strictly from them, then print the answer alongside what was retrieved
-    so a human can verify the citations against the actual source chunks."""
+    """Run one full RAG turn for a single question: retrieve a wide candidate pool,
+    rerank it down to the final few chunks, ask Claude to answer strictly from
+    them, then print the answer alongside both retrieval stages so a human can
+    see what the reranker kept vs. discarded and verify citations against the
+    actual source chunks."""
     # Filters retrieval down to current documents only. Every real chunk is
     # tagged "current" (see ingest.py), so this has no effect today -- it's
     # here so a future superseded document is excluded by construction rather
     # than relying on generation to notice the conflict after the fact.
-    hits = retrieve(collection, question, where={"status": "current"})
+    candidates = retrieve(collection, question, k=INITIAL_K, where={"status": "current"})
+    hits = rerank(question, candidates, top_n=FINAL_K)
     answer = generate_answer(client, hits, question)
 
+    kept = {(h["source"], h["chunk_index"]) for h in hits}
+
     print(f"\n{answer}\n")
-    print("Sources retrieved:")
+    print(f"Initial retrieval (top {len(candidates)} by vector distance; * = kept after rerank):")
+    for hit in sorted(candidates, key=lambda h: h["distance"]):
+        marker = "*" if (hit["source"], hit["chunk_index"]) in kept else " "
+        print(
+            f"  [{marker}] {hit['source']} (chunk {hit['chunk_index']}, "
+            f"distance={hit['distance']:.3f}, rerank_score={hit['rerank_score']:.3f})"
+        )
+    print(f"\nFinal {len(hits)} sent to Claude, in rerank order:")
     for i, hit in enumerate(hits, start=1):
-        print(f"  [{i}] {hit['source']} (chunk {hit['chunk_index']}, distance={hit['distance']:.3f})")
+        print(f"  [{i}] {hit['source']} (chunk {hit['chunk_index']}, rerank_score={hit['rerank_score']:.3f})")
 
 
 def main() -> None:
