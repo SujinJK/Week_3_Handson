@@ -10,19 +10,27 @@ knowledge.
 ```
 corpus/*.md --chunk--> chunking.py --embed (local)--> ingest.py --store--> Chroma
                                                                               |
-                                                                              v
-                                    question --embed (local)--> retrieve top-8 (vector search)
-                                                                              |
-                                                                              v
-                                                    rerank (local cross-encoder) --> top-3
-                                                                              |
-                                                                              v
-                                                          Claude (generate, cite sources)
+                              +-----------------------------------------------+
+                              |                                               |
+                              v                                               v
+                question --embed (local)--> vector top-8            question --tokenize--> BM25 keyword top-8
+                              |                                               |
+                              +-------------------+---------------------------+
+                                                  v
+                                  Reciprocal Rank Fusion (RRF) --> fused top-8
+                                                  |
+                                                  v
+                                  rerank (local cross-encoder) --> top-3
+                                                  |
+                                                  v
+                                  Claude (generate, cite sources)
 ```
 
-Retrieval, reranking, chunking, and embedding are all entirely local and
-free — no API calls, no cost. Only the final answer-generation step calls
-Claude.
+Retrieval, keyword search, fusion, reranking, chunking, and embedding are
+all entirely local and free — no API calls, no cost. Only the final
+answer-generation step calls Claude. (A query-transformation step, HyDE,
+also exists in `rag.py` but is not part of this default path — see "Query
+transformation (HyDE) comparison" below for why.)
 
 ## Project structure
 
@@ -32,14 +40,15 @@ Claude.
 | `corpus_conflict_demo/*.md` | A copy of `corpus/` plus one extra, undated, superseded employee handbook with a different PTO policy — used only by `failure_demos.py` to demonstrate the conflicting/stale-document failure. Never touched by `ingest.py`. |
 | `chunking.py` | Two chunkers: `chunk_text` (fixed word-count, can split a sentence mid-way) and `semantic_chunk_text` (groups whole sentences up to a target size, never splitting one). Pure Python, no dependencies — easy to unit test. |
 | `ingest.py` | Loads `corpus/`, chunks each file with `semantic_chunk_text`, embeds chunks with a local model, stores them in a persistent Chroma collection (`chroma_db/`). |
-| `rag.py` | The Q&A app: retrieves a wide candidate pool by vector similarity, reranks it with a local cross-encoder, sends the final chunks to Claude as context, and prints the cited answer alongside both retrieval stages so you can see what the reranker kept vs. discarded. |
+| `rag.py` | The Q&A app: fuses vector similarity with BM25 keyword search (Reciprocal Rank Fusion), reranks the fused pool with a local cross-encoder, sends the final chunks to Claude as context, and prints the cited answer alongside all retrieval stages so you can see what each signal contributed and what the reranker kept vs. discarded. Also has `hyde_rewrite()` for query transformation, available but not wired into the default path. |
 | `failure_demos.py` | Deliberately triggers 3 real RAG failure modes live against the API, using disposable temporary Chroma collections — see "Failure demos" below. |
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
-| `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free), comparing plain vector search hit@k against hit@k after reranking. |
+| `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free), comparing plain vector search hit@k, hybrid (RRF-fused) hit@k, and hybrid+reranked hit@k side by side. |
 | `eval/generation_eval.py` | Runs the full pipeline (retrieve + generate) for every eval question, then uses a second Claude call as an LLM-as-judge to score faithfulness and citation accuracy. Costs a small amount of API credit — see "Evaluation metrics" below. |
 | `eval/voyage_comparison.py` | Compares local (`all-MiniLM-L6-v2`) vs. Voyage AI (`voyage-4`) embeddings on the same eval set — Anthropic's recommended embeddings provider vs. what this project actually uses. See "Voyage AI comparison" below. |
+| `eval/query_transformation_comparison.py` | Compares raw-question retrieval against HyDE-rewritten-query retrieval on deliberately colloquial questions. See "Query transformation (HyDE) comparison" below — the result argues against using it here. |
 | `tests/test_chunking.py` | Unit tests for the chunking logic (chunk boundaries, overlap, no data loss). |
-| `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`, `voyageai`) / test deps (`pytest`). |
+| `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`, `voyageai`, `rank_bm25`) / test deps (`pytest`). |
 | `.env.example` / `.env` | API key template (`ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`) / your real keys (gitignored). |
 
 ## Setup
@@ -69,6 +78,7 @@ python rag.py              # interactive Q&A loop
 python -m eval.retrieval_eval    # measure retrieval quality (free, no API calls)
 python -m eval.generation_eval   # measure answer faithfulness + citation accuracy (small API cost)
 python -m eval.voyage_comparison # compare local vs Voyage AI embeddings (needs VOYAGE_API_KEY)
+python -m eval.query_transformation_comparison  # raw vs HyDE-rewritten queries (small API cost)
 python failure_demos.py   # watch 3 real RAG failure modes happen live
 pytest                     # unit tests for chunking
 ```
@@ -86,13 +96,19 @@ pytest                     # unit tests for chunking
 - **First run downloads a second local model.** Alongside the embedding
   model, `rag.py`'s reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`)
   downloads from Hugging Face the first time `rerank()` runs — a one-time
-  cost, cached afterward, no API key or cost involved.
-- **Retrieval is free; generation costs money.** Embeddings run entirely on
-  your machine, no API calls — re-run `ingest.py` and
-  `eval/retrieval_eval.py` as often as you want at zero cost. `rag.py` and
-  `eval/generation_eval.py` both call Claude and spend API credit; the
-  latter calls it *twice* per question (generate, then judge), so it's the
-  priciest thing to re-run here — still small, but not free like the rest.
+  cost, cached afterward, no API key or cost involved. BM25 (`rank_bm25`)
+  needs no download at all — it's a plain statistical algorithm, not a
+  trained model, built fresh from whatever's in the collection each time.
+- **Retrieval is free; generation costs money.** Embeddings, BM25, fusion,
+  and reranking all run entirely on your machine, no API calls — re-run
+  `ingest.py` and `eval/retrieval_eval.py` as often as you want at zero
+  cost. `rag.py` and `eval/generation_eval.py` both call Claude and spend
+  API credit; the latter calls it *twice* per question (generate, then
+  judge). `eval/query_transformation_comparison.py` calls it *three* times
+  per question (HyDE rewrite, generate, and — since it's not part of the
+  default pipeline — you'd add a judge call on top for a full comparison);
+  these are the priciest scripts to re-run here — still small, but not free
+  like the rest.
 - **`rag.py` has no conversation memory.** Unlike a chatbot, each question is
   answered independently with no history carried between turns — deliberate,
   to keep retrieval/citation behavior easy to reason about in isolation.
@@ -144,14 +160,23 @@ differently from the source text can still retrieve it.
   respect sentence structure — there's no "cut mid-sentence" case left for
   it to compensate for. `failure_demos.py` demo 2 shows this holding even at
   a 15-word target, far smaller than the sentence it needs to keep whole.
-- **Two-stage retrieval: `INITIAL_K=8` vector candidates, reranked down to
-  `FINAL_K=3`.** `retrieve()` pulls the 8 closest chunks by vector distance;
-  `rerank()` then re-scores all 8 with a local cross-encoder
-  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) and keeps the top 3 by that score.
-  A cross-encoder reads the question and each chunk *together*, so it can
-  catch relevance a bi-encoder's independently-computed embeddings miss —
-  see "Evaluation metrics" below for a real case where it reordered the
-  top result. Runs locally, same as embedding — no added API cost.
+- **Hybrid search: vector + BM25, fused with `RRF_K=60`.** `retrieve()` pulls
+  the 8 closest chunks by vector distance; `bm25_search()` independently
+  ranks the same corpus by exact keyword overlap (via `rank_bm25`); RRF
+  fuses the two ranked lists by `1/(RRF_K + rank)` per list, summed per
+  chunk — rank position only, so raw score scale (cosine distance vs. BM25
+  score) never has to be reconciled. Catches proper nouns, acronyms, and
+  specific terms that an embedding model can under-weight — see "Evaluation
+  metrics" below for a real case (the term "TOTP") where vector search alone
+  got the wrong document.
+- **Three-stage retrieval, `INITIAL_K=8` down to `FINAL_K=3`.** The 8 fused
+  candidates then get reranked: `rerank()` re-scores all 8 with a local
+  cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) and keeps the top 3.
+  A cross-encoder reads the question and each chunk *together*, catching
+  relevance neither the bi-encoder nor BM25 alone weighted correctly — see
+  "Evaluation metrics" for the same "TOTP" case, where fusion alone still
+  got the top slot wrong and reranking is what actually fixed it. All three
+  stages run locally — no added API cost over plain vector search.
 - **Embedding model: `all-MiniLM-L6-v2`** (384 dimensions) — a small,
   general-purpose local model. Scored identically to Anthropic's recommended
   Voyage AI embeddings on this corpus's eval set (see "Voyage AI comparison"
@@ -174,20 +199,15 @@ differently from the source text can still retrieve it.
   without deleting the file or touching the ingest pipeline. See "Failure
   demos" below for this actually fixing the stale-document problem.
 
-**What a production RAG system would add that this one still doesn't:**
-- **Hybrid search** — combining vector similarity with old-fashioned keyword
-  search (e.g. BM25), since embeddings can miss exact matches like product
-  codes, ticket IDs, or specific terminology.
-- **Query transformation** — rewriting or expanding the user's question
-  before embedding it, to bridge cases where the question's wording is very
-  different from the document's wording.
-
-We skipped both deliberately — the corpus is small and clean enough that
-plain vector search already hits 8/8 on the eval set, so adding them here
-would be complexity without a measurable benefit. They become worth it as
-the corpus grows or gets noisier. (Reranking used to be on this list too —
-see "Evaluation metrics" below for why we added it anyway, and the
-"Terminology" table for how it's wired in.)
+**What's left that a production RAG system might still add:** at this
+point, not much from the standard RAG toolkit — hybrid search, reranking,
+and metadata filtering are all wired into the default pipeline, and query
+transformation (HyDE) was built and tested, not skipped (see "Query
+transformation (HyDE) comparison" below for why we chose not to enable it).
+The honest gaps left are less about retrieval techniques and more about
+production concerns: automated generation-quality scoring at scale beyond
+an 8-question eval set, and the items in "Challenges RAG systems face at
+scale" below (freshness, cost/latency at real volume, access control).
 
 ## Evaluation metrics
 
@@ -201,9 +221,10 @@ python -m eval.retrieval_eval
 ```
 
 - **k = 3**, matching `rag.py`'s final retrieval count.
-- **Current score: 8/8 (100%) both with plain vector search AND after
-  reranking** (retrieve 8, rerank to 3) — reranking didn't change which
-  documents passed on this small, topically-distinct corpus.
+- **Current score: 8/8 (100%) across all three strategies** — plain vector
+  search, vector+BM25 fused (RRF), and fused-then-reranked (the full
+  pipeline). None of them change which documents pass on this small,
+  topically-distinct corpus.
 - **No API calls, so it's free** — this only exercises retrieval, not
   generation.
 
@@ -215,14 +236,31 @@ RAG fails" below, failure mode #1). Its main weakness is that it's
 to one retrieved as chunk #3. A rank-aware metric like Mean Reciprocal Rank
 (MRR) or NDCG would additionally reward retrieving the right chunk *higher*,
 which hit@k can't distinguish — and that blindness is exactly why the
-identical 8/8 scores understate reranking's effect here. In the eval run,
-reranking changed the actual *ordering* for 2 of the 8 questions even though
-hit@3 didn't move. `rag.py` shows a clearer case live: for "how long are
-files kept in Trash," vector distance ranked `refund_policy.md` closest
-(0.465) over `product_faq.md` (0.524) — the actually-correct source — but
-the cross-encoder scored them 0.485 vs. **4.466**, correctly promoting
-`product_faq.md` to #1. Hit@3 is blind to this because both chunks were in
-the top 3 either way; an MRR-style metric would have caught the improvement.
+identical 8/8 scores understate what reranking and hybrid search actually
+do here. Two real cases the eval set's hit@k misses entirely:
+
+- For "how long are files kept in Trash," vector distance ranked
+  `refund_policy.md` closest (0.465) over `product_faq.md` (0.524) — the
+  actually-correct source — but the cross-encoder scored them 0.485 vs.
+  **4.466**, correctly promoting `product_faq.md` to #1. Hit@3 is blind to
+  this because both chunks were in the top 3 either way.
+- **The single-word query `"TOTP"` is the clearest case in the whole
+  project.** Vector search alone gets it **wrong**: it ranks
+  `employee_handbook.md` closest (distance 0.795) over the actually-correct
+  `security_policy.md` (0.799) — a near-tie a short, context-poor query
+  doesn't give the embedding model enough to resolve. BM25 alone gets it
+  **right**, since "TOTP" is an exact term that only appears in
+  `security_policy.md` (score 1.68 vs. 0.0 for every other document). But
+  **RRF fusion still got the top slot wrong** (`employee_handbook.md` at
+  0.0325 vs. `security_policy.md` at 0.0323) — a real limitation of rank-only
+  fusion: it counted `employee_handbook.md`'s presence in BM25's top-3
+  (with a genuine score of 0.0, just filling out the requested k) as equally
+  meaningful as a real match, at the same rank position. **Reranking is what
+  actually fixed it**, scoring `security_policy.md` at 0.107 against
+  strongly negative scores (-10.35, -10.38) for the others. Three stages,
+  each catching what the one before it missed — none of it visible in a
+  hit@3 score that was 8/8 the whole time because the corpus is small enough
+  that *something* correct always lands in the top 3.
 
 **Generation-quality metrics: `eval/generation_eval.py`.** Runs the real
 pipeline end-to-end (retrieve + generate) for each eval question, then uses
@@ -307,6 +345,56 @@ zero measured benefit, for the cost of a second API key, an external
 account, and losing the "no signup required" simplicity of the local model.
 That calculus would flip on a larger or more ambiguous corpus — this
 comparison exists to make that a measured decision later, not a guess now.
+
+## Query transformation (HyDE) comparison
+
+The last item from the original "skipped techniques" list — and the only
+one of the four (reranking, metadata filtering, hybrid search, query
+transformation) that we built, tested, and then chose **not** to enable.
+
+**HyDE (Hypothetical Document Embeddings):** instead of embedding the raw
+question, ask Claude to write a short hypothetical passage that would
+plausibly answer it, in the corpus's own documentation style, and embed
+*that* instead. The idea: a casual question and a formal policy sentence
+can mean the same thing while sharing almost no vocabulary, which hurts
+vector similarity even though the embedding model handles ordinary
+paraphrasing fine.
+
+```
+python -m eval.query_transformation_comparison
+```
+
+**Result: it made retrieval worse, not better.** On 3 deliberately
+colloquial test questions (phrased far from the corpus's own wording), hit@3
+went from **3/3 with the raw question to 2/3 with the HyDE-rewritten
+query**. The hypothetical passages read as fluent, confident policy prose —
+and were specifically wrong: one invented a **24-hour** reporting window
+where the real document says **1 hour**; another invented a **60-day**
+grace period where the real document says **14 days**; a third invented a
+support email domain (`security@nimbuscloud.com`) that isn't the real one
+(`security@nimbus.example`). None of that is shown to the user — it only
+ever exists to be embedded — but the fabricated specifics pulled the
+resulting vector toward a neighborhood the *real* document doesn't
+actually occupy, which is exactly backwards from what the technique is
+supposed to do.
+
+**Why this happened:** HyDE's premise is that a hypothetical answer's
+*style* is closer to the corpus than the question's style is. That's true,
+but style isn't the only thing that determines embedding similarity —
+specific, confidently-wrong facts are also part of what gets embedded, and
+this corpus's hybrid retrieval (vector + BM25) already closes most of the
+phrasing gap HyDE is meant to fix, so there was little upside left to
+capture and real downside from the hallucination risk.
+
+**Why `hyde_rewrite()` still exists in `rag.py` instead of being deleted:**
+this is a real, working implementation of a real technique — it's just not
+wired into `answer_question()`'s default path, and this comparison is the
+reason why, documented rather than silently omitted. A corpus with a much
+larger vocabulary gap between questions and documents (jargon-heavy legal
+or medical text, for instance) is where this tradeoff could flip; nothing
+here rules that out, it just didn't hold on this corpus.
+
+## Challenges RAG systems face at scale (beyond what this project shows)
 
 This project is small and clean on purpose, so it doesn't hit every
 challenge a production RAG system runs into. Worth knowing about even
@@ -459,15 +547,23 @@ describing the fix.
 | Reranking | A second-stage model that re-scores initial vector-search results, using a slower but more accurate method, before picking the final k | `rerank()` in `rag.py`, using a local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`); retrieves 8 candidates by vector distance, reranks to the final 3 — see "Evaluation metrics" for a real case where this reordered the top result |
 | Bi-encoder vs. cross-encoder | A bi-encoder embeds query and document separately, then compares vectors (fast, used for the initial wide retrieval); a cross-encoder reads both together and scores relevance directly (slower, more accurate, only practical over a small candidate pool) | `all-MiniLM-L6-v2` (bi-encoder, `ingest.py`/`rag.py`'s `retrieve()`) vs. `cross-encoder/ms-marco-MiniLM-L-6-v2` (`rag.py`'s `rerank()`) |
 | Asymmetric query/document embedding (`input_type`) | Embedding a search query and the documents it searches with different, retrieval-optimized settings, rather than treating both the same way | `voyageai.Client.embed(..., input_type="document")` at ingest vs. `input_type="query"` at search time, in `eval/voyage_comparison.py` — done by calling the Voyage client directly instead of Chroma's bound embedding-function wrapper, which only supports one `input_type` for both |
+| Hybrid search | Combining vector similarity with keyword search (e.g. BM25), so a chunk that wins on either signal becomes a candidate | `hybrid_retrieve()` in `rag.py`, fusing `retrieve()` (vector) and `bm25_search()` (BM25) — see "Evaluation metrics" for the "TOTP" case where vector search alone got the wrong document |
+| Reciprocal Rank Fusion (RRF) | Combining two differently-scaled ranked lists (e.g. cosine distance and BM25 score) by rank position alone, avoiding the need to reconcile incomparable score scales | `RRF_K=60` in `rag.py`'s `hybrid_retrieve()` — also the finding that RRF alone doesn't always get the top slot right (see "Evaluation metrics"), which is exactly why reranking still runs afterward |
 
-**Standard RAG techniques we deliberately skipped** (see "What a production
-RAG system would add" and "Challenges RAG systems face at scale" above for
-why each matters and when it'd be worth adding):
+**Built, tested, and deliberately not adopted** — different from "skipped"
+below: this one has real working code, was run against the real API, and
+the result argued against turning it on:
+
+| Term | What it means | What we found |
+|---|---|---|
+| Query transformation / HyDE | Rewriting or expanding the question before embedding it (Hypothetical Document Embeddings: embed an LLM-generated hypothetical answer instead of the raw question) | `hyde_rewrite()` in `rag.py`; `eval/query_transformation_comparison.py` found it **reduced** hit@3 from 3/3 to 2/3 on deliberately colloquial test questions — the hypothetical passages fabricated specific wrong facts (wrong hours, wrong day counts, wrong email domain) that pulled retrieval toward the wrong neighborhood. See "Query transformation (HyDE) comparison" above. |
+
+**Standard RAG techniques we deliberately skipped** (see "Challenges RAG
+systems face at scale" above for why each matters and when it'd be worth
+adding):
 
 | Term | What it means | Why we skipped it here |
 |---|---|---|
-| Hybrid search | Combining vector similarity with keyword search (e.g. BM25) | No exact-match terms (IDs, codes) in this corpus that vector search would miss |
-| Query transformation / expansion / HyDE | Rewriting the question before embedding it to better match document phrasing | Questions in the eval set were already phrased close enough to the source text |
 | `temperature` / `top_p` | Generation-time randomness controls (unrelated to retrieval's `top_k`, despite the similar name) | Not accepted at all by `claude-opus-4-8` — Anthropic replaced them with `effort` on recent models |
 | Access control / permission-filtered retrieval | Restricting which documents a given user's queries can retrieve, e.g. `where={"allowed_roles": {"$in": [user_role]}}` | Single-user demo corpus with no real permission boundaries to enforce — the same metadata-filtering mechanism now used for `status` (see "Used in this project" above) is exactly how this would be built; we just never added an `allowed_roles` tag because there's no second user to restrict |
 | Incremental indexing | Updating the vector store for changed documents only, instead of a full rebuild | `ingest.py` rebuilds from scratch every run — fine at 5 documents, not at scale |

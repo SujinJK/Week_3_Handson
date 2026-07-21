@@ -3,3 +3,4 @@ python-dotenv
 chromadb
 sentence-transformers
 voyageai
+rank_bm25

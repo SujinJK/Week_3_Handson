@@ -8,11 +8,13 @@ Run:
     python rag.py       # interactive Q&A loop
 """
 import pathlib
+import re
 
 import anthropic
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from ingest import COLLECTION_NAME, DB_DIR, EMBEDDING_MODEL
@@ -25,8 +27,21 @@ MODEL = "claude-opus-4-8"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 INITIAL_K = 8  # wider candidate pool handed to the reranker
 FINAL_K = 3    # how many chunks actually reach Claude, after reranking
+RRF_K = 60     # standard damping constant for Reciprocal Rank Fusion
 
 _reranker: CrossEncoder | None = None
+_bm25_index_cache: dict[int, tuple[BM25Okapi, list[dict]]] = {}
+_TOKEN_RE = re.compile(r"\w+")
+
+HYDE_SYSTEM_PROMPT = (
+    "Write a single short passage (1-2 sentences) that would plausibly "
+    "appear in Nimbus Cloud Storage's internal policy documents and would "
+    "directly answer the user's question. State a plausible-sounding policy "
+    "as flat fact, in the same neutral, factual style as a company "
+    "handbook or FAQ — do not hedge, do not say you're unsure, do not "
+    "address the user directly. This hypothetical passage is only used to "
+    "improve document search; it is never shown to the user."
+)
 
 SYSTEM_PROMPT = (
     "You are a support assistant for Nimbus Cloud Storage. Answer the "
@@ -69,6 +84,67 @@ def retrieve(
             "distance": distance,
         })
     return hits
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word tokenizer for BM25 -- doesn't need to match embedding
+    preprocessing, just needs to be consistent between corpus and query."""
+    return _TOKEN_RE.findall(text.lower())
+
+
+def _get_bm25_index(collection: chromadb.Collection) -> tuple[BM25Okapi, list[dict]]:
+    """Build (and cache, keyed by collection object identity) a BM25 index over
+    every current chunk in the collection."""
+    cache_key = id(collection)
+    if cache_key not in _bm25_index_cache:
+        result = collection.get(where={"status": "current"})
+        chunks = [
+            {"text": text, "source": meta["source"], "chunk_index": meta["chunk_index"]}
+            for text, meta in zip(result["documents"], result["metadatas"])
+        ]
+        tokenized_corpus = [_tokenize(c["text"]) for c in chunks]
+        _bm25_index_cache[cache_key] = (BM25Okapi(tokenized_corpus), chunks)
+    return _bm25_index_cache[cache_key]
+
+
+def bm25_search(collection: chromadb.Collection, question: str, k: int) -> list[dict]:
+    """Keyword search over the corpus using BM25 -- exact term overlap, unlike
+    vector search's semantic similarity. Catches proper nouns, IDs, and
+    specific terminology that an embedding model can under-weight."""
+    bm25, chunks = _get_bm25_index(collection)
+    scores = bm25.get_scores(_tokenize(question))
+    ranked = sorted(zip(chunks, scores), key=lambda pair: pair[1], reverse=True)
+    return [{**chunk, "bm25_score": float(score)} for chunk, score in ranked[:k]]
+
+
+def hybrid_retrieve(collection: chromadb.Collection, question: str, k: int = INITIAL_K) -> list[dict]:
+    """Fuse vector search and BM25 keyword search with Reciprocal Rank Fusion
+    (RRF), so a chunk that ranks well on EITHER signal surfaces as a
+    candidate -- not just chunks that win on semantic similarity alone.
+
+    RRF scores each chunk by 1/(RRF_K + rank) in each ranked list it appears
+    in, then sums across lists. It only needs rank position, not raw score
+    magnitude, which sidesteps the fact that vector distance and BM25 score
+    aren't on comparable scales.
+    """
+    vector_hits = retrieve(collection, question, k=k, where={"status": "current"})
+    keyword_hits = bm25_search(collection, question, k=k)
+
+    fused_scores: dict[tuple, float] = {}
+    chunk_lookup: dict[tuple, dict] = {}
+    for ranked_list in (vector_hits, keyword_hits):
+        for rank, hit in enumerate(ranked_list):
+            key = (hit["source"], hit["chunk_index"])
+            fused_scores[key] = fused_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            chunk_lookup[key] = {**chunk_lookup.get(key, {}), **hit}
+
+    ranked_keys = sorted(fused_scores, key=lambda key: fused_scores[key], reverse=True)
+    results = []
+    for key in ranked_keys[:k]:
+        hit = dict(chunk_lookup[key])
+        hit["rrf_score"] = fused_scores[key]
+        results.append(hit)
+    return results
 
 
 def get_reranker() -> CrossEncoder:
@@ -122,29 +198,58 @@ def generate_answer(client: anthropic.Anthropic, hits: list[dict], question: str
     return next(b.text for b in response.content if b.type == "text")
 
 
+def hyde_rewrite(client: anthropic.Anthropic, question: str) -> str:
+    """HyDE (Hypothetical Document Embeddings): ask Claude to imagine what a
+    real answer to this question would look like, written in the corpus's
+    own style, then embed THAT instead of the raw question.
+
+    Bridges the gap between a casual question and formal document phrasing --
+    a colloquial question and a policy sentence can mean the same thing while
+    barely sharing any words, which hurts vector similarity even though the
+    embedding model handles paraphrasing well in general. Costs one extra
+    Claude call per question, so unlike every other retrieval technique in
+    this file, it is NOT free -- not wired into answer_question() by default
+    for that reason. See eval/query_transformation_comparison.py.
+    """
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=150,
+        system=HYDE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": question}],
+    )
+    return next(b.text for b in response.content if b.type == "text")
+
+
 def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection, question: str) -> None:
-    """Run one full RAG turn for a single question: retrieve a wide candidate pool,
-    rerank it down to the final few chunks, ask Claude to answer strictly from
-    them, then print the answer alongside both retrieval stages so a human can
-    see what the reranker kept vs. discarded and verify citations against the
-    actual source chunks."""
-    # Filters retrieval down to current documents only. Every real chunk is
-    # tagged "current" (see ingest.py), so this has no effect today -- it's
-    # here so a future superseded document is excluded by construction rather
-    # than relying on generation to notice the conflict after the fact.
-    candidates = retrieve(collection, question, k=INITIAL_K, where={"status": "current"})
+    """Run one full RAG turn for a single question: fuse vector + keyword search
+    into a wide candidate pool, rerank it down to the final few chunks, ask
+    Claude to answer strictly from them, then print the answer alongside both
+    retrieval stages so a human can see what the reranker kept vs. discarded
+    and verify citations against the actual source chunks."""
+    # hybrid_retrieve() filters to current documents only (via retrieve()'s
+    # where clause) and fuses it with BM25 keyword search. Every real chunk
+    # is tagged "current" (see ingest.py), so the status filter is a no-op
+    # today -- it's here so a future superseded document is excluded by
+    # construction rather than relying on generation to notice the conflict.
+    candidates = hybrid_retrieve(collection, question, k=INITIAL_K)
     hits = rerank(question, candidates, top_n=FINAL_K)
     answer = generate_answer(client, hits, question)
 
     kept = {(h["source"], h["chunk_index"]) for h in hits}
 
     print(f"\n{answer}\n")
-    print(f"Initial retrieval (top {len(candidates)} by vector distance; * = kept after rerank):")
-    for hit in sorted(candidates, key=lambda h: h["distance"]):
+    print(f"Initial retrieval (top {len(candidates)} by vector+keyword fusion; * = kept after rerank):")
+    for hit in sorted(candidates, key=lambda h: h["rrf_score"], reverse=True):
         marker = "*" if (hit["source"], hit["chunk_index"]) in kept else " "
+        signals = []
+        if "distance" in hit:
+            signals.append(f"distance={hit['distance']:.3f}")
+        if "bm25_score" in hit:
+            signals.append(f"bm25={hit['bm25_score']:.2f}")
         print(
             f"  [{marker}] {hit['source']} (chunk {hit['chunk_index']}, "
-            f"distance={hit['distance']:.3f}, rerank_score={hit['rerank_score']:.3f})"
+            f"rrf={hit['rrf_score']:.4f}, {', '.join(signals)}, "
+            f"rerank_score={hit['rerank_score']:.3f})"
         )
     print(f"\nFinal {len(hits)} sent to Claude, in rerank order:")
     for i, hit in enumerate(hits, start=1):

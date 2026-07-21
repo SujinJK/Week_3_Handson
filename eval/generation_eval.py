@@ -25,8 +25,8 @@ from rag import (  # noqa: E402
     build_context_block,
     generate_answer,
     get_collection,
+    hybrid_retrieve,
     rerank,
-    retrieve,
 )
 
 load_dotenv()
@@ -86,7 +86,7 @@ def run_eval(k: int = 3) -> None:
     citations_valid_count = 0
     for case in eval_cases:
         question = case["question"]
-        candidates = retrieve(collection, question, k=INITIAL_K, where={"status": "current"})
+        candidates = hybrid_retrieve(collection, question, k=INITIAL_K)
         hits = rerank(question, candidates, top_n=k)
         context = build_context_block(hits)
         answer = generate_answer(client, hits, question)
