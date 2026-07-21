@@ -11,13 +11,14 @@ Run:
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 import anthropic
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
-from chunking import chunk_text
+from chunking import chunk_text, semantic_chunk_text
 from ingest import EMBEDDING_MODEL
 from rag import MODEL, SYSTEM_PROMPT, get_collection
 
@@ -28,14 +29,20 @@ CONFLICT_CORPUS_DIR = Path(__file__).parent / "corpus_conflict_demo"
 
 
 def _build_temp_collection(
-    corpus_dir: Path, chunk_size: int, overlap: int, status_map: dict[str, str] | None = None
+    corpus_dir: Path,
+    chunk_fn: Callable[[str], list[str]],
+    status_map: dict[str, str] | None = None,
 ) -> tuple[chromadb.Collection, str]:
-    """Ingest a corpus into a fresh, disposable Chroma collection with custom
-    chunking parameters. Returns (collection, temp_dir) — caller must clean up temp_dir.
+    """Ingest a corpus into a fresh, disposable Chroma collection using the
+    given chunking function. Returns (collection, temp_dir) — caller must
+    clean up temp_dir.
 
-    status_map optionally overrides the "status" metadata for specific
-    filenames (e.g. {"employee_handbook_2023.md": "superseded"}); any file not
-    in the map defaults to "current", matching ingest.py's real behavior."""
+    chunk_fn takes document text and returns a list of chunk strings — pass
+    e.g. `lambda text: semantic_chunk_text(text, max_chunk_size=120)` or
+    `lambda text: chunk_text(text, chunk_size=8, overlap=0)` to compare
+    strategies. status_map optionally overrides the "status" metadata for
+    specific filenames (e.g. {"employee_handbook_2023.md": "superseded"});
+    any file not in the map defaults to "current", matching ingest.py."""
     status_map = status_map or {}
     temp_dir = tempfile.mkdtemp(prefix="rag_failure_demo_")
     client = chromadb.PersistentClient(path=temp_dir)
@@ -46,7 +53,7 @@ def _build_temp_collection(
     for path in sorted(corpus_dir.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         status = status_map.get(path.name, "current")
-        for i, chunk in enumerate(chunk_text(text, chunk_size=chunk_size, overlap=overlap)):
+        for i, chunk in enumerate(chunk_fn(text)):
             ids.append(f"{path.stem}::{i}")
             documents.append(chunk)
             metadatas.append({"source": path.name, "chunk_index": i, "status": status})
@@ -132,9 +139,11 @@ def demo_2_chunking_failure(client: anthropic.Anthropic) -> None:
     """Failure mode: bad chunking fragments the fact the question needs.
 
     refund_policy.md has one sentence containing both "full refund" and
-    "5 business days". With very small, non-overlapping chunks, that
-    sentence gets split across chunk boundaries, so no single retrieved
-    chunk contains the complete fact.
+    "5 business days". With very small, non-overlapping word-count chunks,
+    that sentence gets split across chunk boundaries, so no single retrieved
+    chunk contains the complete fact. Semantic chunking (what ingest.py
+    actually uses) never splits a sentence, at any target size -- shown
+    here at an aggressively small max_chunk_size to prove the point.
     """
     print("=" * 70)
     print("DEMO 2: Chunking failure (answer fragmented across chunk boundaries)")
@@ -143,29 +152,49 @@ def demo_2_chunking_failure(client: anthropic.Anthropic) -> None:
     question = "If I'm charged incorrectly, how many business days until I get a refund?"
 
     # Normal pipeline chunking (what ingest.py actually uses) — control case.
-    good_collection, good_dir = _build_temp_collection(CORPUS_DIR, chunk_size=120, overlap=30)
+    good_collection, good_dir = _build_temp_collection(
+        CORPUS_DIR, chunk_fn=lambda text: semantic_chunk_text(text, max_chunk_size=120)
+    )
     good_hits = good_collection.query(query_texts=[question], n_results=1)
     good_context = good_hits["documents"][0][0]
-    print(f"\n--- Normal chunking (120 words, 30 overlap) — retrieved chunk ---\n{good_context}\n")
+    print(f"\n--- Semantic chunking, 120-word target (normal) — retrieved chunk ---\n{good_context}\n")
     print(_ask(client, SYSTEM_PROMPT, f"[1] (source: refund_policy.md)\n{good_context}", question))
 
-    # Deliberately broken: tiny chunks, no overlap.
-    bad_collection, bad_dir = _build_temp_collection(CORPUS_DIR, chunk_size=8, overlap=0)
+    # Deliberately broken: tiny word-count chunks, no overlap.
+    bad_collection, bad_dir = _build_temp_collection(
+        CORPUS_DIR, chunk_fn=lambda text: chunk_text(text, chunk_size=8, overlap=0)
+    )
     bad_hits = bad_collection.query(query_texts=[question], n_results=1)
     bad_context = bad_hits["documents"][0][0]
-    print(f"\n--- Broken chunking (8 words, 0 overlap) — retrieved chunk ---\n{bad_context}\n")
+    print(f"\n--- Word-count chunking, 8 words, no overlap (broken) — retrieved chunk ---\n{bad_context}\n")
     print(_ask(client, SYSTEM_PROMPT, f"[1] (source: refund_policy.md)\n{bad_context}", question))
+
+    # Semantic chunking pushed to an aggressively small target size (15
+    # words) -- the key sentence is ~30 words, far over target, but it still
+    # comes back whole as its own over-sized chunk rather than being cut.
+    tiny_collection, tiny_dir = _build_temp_collection(
+        CORPUS_DIR, chunk_fn=lambda text: semantic_chunk_text(text, max_chunk_size=15)
+    )
+    tiny_hits = tiny_collection.query(query_texts=[question], n_results=1)
+    tiny_context = tiny_hits["documents"][0][0]
+    print(f"\n--- Semantic chunking, 15-word target (small on purpose) — retrieved chunk ---\n{tiny_context}\n")
+    print(_ask(client, SYSTEM_PROMPT, f"[1] (source: refund_policy.md)\n{tiny_context}", question))
 
     shutil.rmtree(good_dir, ignore_errors=True)
     shutil.rmtree(bad_dir, ignore_errors=True)
+    shutil.rmtree(tiny_dir, ignore_errors=True)
 
     print(
         "\n[Why this matters] The fact ('5 business days') and the claim it "
-        "attaches to ('full refund') live in the same sentence. Chunking too "
-        "aggressively can split them apart, so even a chunk that gets "
-        "retrieved doesn't contain the complete, answerable fact — the "
-        "grounded system prompt then has to either guess or correctly refuse, "
-        "neither of which is as good as just answering correctly.\n"
+        "attaches to ('full refund') live in the same sentence. Word-count "
+        "chunking splits them apart whenever the target size happens to cut "
+        "through that sentence — the grounded system prompt then has to "
+        "either guess or correctly refuse, neither as good as just answering "
+        "correctly. Semantic chunking can't make this specific mistake: it "
+        "only ever breaks between sentences, so even at a target size far "
+        "smaller than the sentence itself, the sentence comes back whole "
+        "(as an over-sized chunk) rather than fragmented. The tradeoff is a "
+        "less predictable chunk size, not a wrong answer.\n"
     )
 
 
@@ -189,7 +218,9 @@ def demo_3_conflicting_sources_failure(client: anthropic.Anthropic) -> None:
     # metadata filtering needs in order to do anything.
     status_map = {"employee_handbook_2023.md": "superseded"}
     collection, temp_dir = _build_temp_collection(
-        CONFLICT_CORPUS_DIR, chunk_size=120, overlap=30, status_map=status_map
+        CONFLICT_CORPUS_DIR,
+        chunk_fn=lambda text: semantic_chunk_text(text, max_chunk_size=120),
+        status_map=status_map,
     )
 
     # k=1, NO filter: if the stale doc ranks closer than the current one,

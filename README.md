@@ -26,8 +26,8 @@ no API calls, no cost. Only the final answer-generation step calls Claude.
 |---|---|
 | `corpus/*.md` | 5 sample "company knowledge base" documents (HR, security, product, billing, incidents) — deliberately on different topics so retrieval quality is testable. |
 | `corpus_conflict_demo/*.md` | A copy of `corpus/` plus one extra, undated, superseded employee handbook with a different PTO policy — used only by `failure_demos.py` to demonstrate the conflicting/stale-document failure. Never touched by `ingest.py`. |
-| `chunking.py` | Splits document text into overlapping word-count chunks. Pure Python, no dependencies — easy to unit test. |
-| `ingest.py` | Loads `corpus/`, chunks each file, embeds chunks with a local model, stores them in a persistent Chroma collection (`chroma_db/`). |
+| `chunking.py` | Two chunkers: `chunk_text` (fixed word-count, can split a sentence mid-way) and `semantic_chunk_text` (groups whole sentences up to a target size, never splitting one). Pure Python, no dependencies — easy to unit test. |
+| `ingest.py` | Loads `corpus/`, chunks each file with `semantic_chunk_text`, embeds chunks with a local model, stores them in a persistent Chroma collection (`chroma_db/`). |
 | `rag.py` | The Q&A app: embeds the question, retrieves the top-k most similar chunks, sends them to Claude as context, prints the cited answer and which chunks were retrieved. |
 | `failure_demos.py` | Deliberately triggers 3 real RAG failure modes live against the API, using disposable temporary Chroma collections — see "Failure demos" below. |
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
@@ -115,11 +115,15 @@ differently from the source text can still retrieve it.
   rank results identically, so retrieval quality is unaffected here, but the
   raw distance *numbers* printed by `rag.py` are squared-L2 values, not
   cosine similarity scores — don't read them as "0 to 1."
-- **`chunk_size=120`, `overlap=30` words** in `chunking.py` — too
-  large and irrelevant text dilutes the embedding, drowning out the specific
-  fact being asked about; too small and a chunk loses the surrounding
-  sentence that explains it. Overlap prevents an answer from being split
-  exactly at a chunk boundary.
+- **Chunking: `semantic_chunk_text(max_chunk_size=120)`, no overlap.**
+  `ingest.py` originally used the word-count `chunk_text` (120 words, 30
+  overlap) — kept in `chunking.py` for tests and comparison, but no longer
+  what production uses. Semantic chunking groups whole sentences up to the
+  target size instead, so a chunk boundary only ever falls between
+  sentences, never inside one. Overlap becomes unnecessary once boundaries
+  respect sentence structure — there's no "cut mid-sentence" case left for
+  it to compensate for. `failure_demos.py` demo 2 shows this holding even at
+  a 15-word target, far smaller than the sentence it needs to keep whole.
 - **k=3** retrieved chunks per question — enough that the right chunk is
   very likely included even if it's not the single closest match, without
   flooding Claude's context with irrelevant chunks that could get cited by
@@ -305,14 +309,21 @@ trip up this particular model; the retrieval blind spot underneath it is
 still real, and weaker models or trickier questions can and do fall through
 it.)
 
-**2. Chunking can fragment a fact away from itself.** The sentence "Nimbus
-issues a **full refund** ... within **5 business days**" got fed through a
-deliberately broken chunker (8-word chunks, no overlap). The retrieved
-fragment was just `"charge within 5 business days of the report"` — missing
-"full refund" entirely. Claude still recovered the number correctly, purely
-by luck of where the boundary happened to fall; a slightly different chunk
-size could easily have cut the fragment before "5 business days" instead,
-losing the answer entirely. Real degradation, not always a *visible* one.
+**2. Chunking can fragment a fact away from itself — and semantic chunking
+fixes it.** The sentence "Nimbus issues a **full refund** ... within
+**5 business days**" got fed through three chunkers. Word-count chunking
+(8 words, no overlap — the deliberately broken case) returned just
+`"charge within 5 business days of the report"`, missing "full refund"
+entirely; Claude still recovered the number correctly, purely by luck of
+where the boundary fell. Semantic chunking at the normal 120-word target
+returned the whole sentence intact. The real test: semantic chunking pushed
+to an aggressively small **15-word** target — far smaller than the ~30-word
+sentence itself — still returned the entire sentence whole (as one
+over-sized chunk) rather than cutting it, because semantic chunking only
+ever breaks *between* sentences. This is why `ingest.py` uses
+`semantic_chunk_text` now instead of the word-count chunker: it eliminates
+this failure mode structurally rather than relying on choosing a large
+enough chunk size and hoping the boundary doesn't land badly.
 
 **3. Conflicting/stale documents produce the most dangerous failure of the
 three.** We added a second, undated employee handbook with a different
@@ -367,6 +378,7 @@ describing the fix.
 | Retrieval evaluation / hit@k | Measuring whether the right document was retrieved, separate from answer quality | `eval/retrieval_eval.py` |
 | Metadata filtering | Restricting *which* chunks a query searches over, using stored metadata, before similarity ranking happens | `where={"status": "current"}` in `retrieve()` (`rag.py`); every real chunk is tagged `"current"` so it's a no-op today — `failure_demos.py` demo 3 shows it actually excluding a stale document when one exists |
 | LLM-as-judge | Using a separate LLM call to grade another LLM call's output against a rubric, instead of grading by hand | `eval/generation_eval.py`'s `judge_answer()` — grades faithfulness and citation accuracy using `output_config.format` for a reliably parseable verdict |
+| Semantic chunking | Splitting on sentence boundaries and grouping whole sentences up to a target size, instead of a fixed word count | `semantic_chunk_text()` in `chunking.py`, used by `ingest.py`; a chunk boundary only ever falls between sentences, never inside one — `failure_demos.py` demo 2 proves this holds even at a 15-word target far smaller than the sentence it must keep whole |
 
 **Standard RAG techniques we deliberately skipped** (see "What a production
 RAG system would add" and "Challenges RAG systems face at scale" above for
@@ -378,7 +390,6 @@ why each matters and when it'd be worth adding):
 | Hybrid search | Combining vector similarity with keyword search (e.g. BM25) | No exact-match terms (IDs, codes) in this corpus that vector search would miss |
 | Query transformation / expansion / HyDE | Rewriting the question before embedding it to better match document phrasing | Questions in the eval set were already phrased close enough to the source text |
 | `temperature` / `top_p` | Generation-time randomness controls (unrelated to retrieval's `top_k`, despite the similar name) | Not accepted at all by `claude-opus-4-8` — Anthropic replaced them with `effort` on recent models |
-| Semantic chunking | Splitting on sentence/paragraph boundaries instead of a fixed word count | Fixed-size chunking with overlap was simpler and sufficient for this corpus; demo 2 in `failure_demos.py` shows exactly the failure semantic chunking would help avoid |
 | Access control / permission-filtered retrieval | Restricting which documents a given user's queries can retrieve, e.g. `where={"allowed_roles": {"$in": [user_role]}}` | Single-user demo corpus with no real permission boundaries to enforce — the same metadata-filtering mechanism now used for `status` (see "Used in this project" above) is exactly how this would be built; we just never added an `allowed_roles` tag because there's no second user to restrict |
 | Incremental indexing | Updating the vector store for changed documents only, instead of a full rebuild | `ingest.py` rebuilds from scratch every run — fine at 5 documents, not at scale |
 | Agentic / multi-hop RAG | The model deciding whether/what to retrieve, and issuing further retrievals based on what it finds | Every question here is answered in a single retrieve-then-generate pass |
@@ -386,9 +397,19 @@ why each matters and when it'd be worth adding):
 ## Test cases
 
 **`tests/test_chunking.py`**
+
+`TestChunkText` (the word-count chunker, kept for comparison — not what `ingest.py` uses):
 - `test_empty_string_returns_no_chunks` — empty input produces no chunks
 - `test_short_text_returns_single_chunk` — text shorter than chunk_size isn't split
 - `test_splits_into_multiple_chunks_when_over_size` — long text is split
 - `test_consecutive_chunks_overlap` — the overlap words actually repeat between chunks
 - `test_all_words_are_preserved_across_chunks` — no words are silently dropped
 - `test_rejects_overlap_greater_than_or_equal_to_chunk_size` — invalid config raises instead of looping forever
+
+`TestSemanticChunkText` (what `ingest.py` actually uses):
+- `test_empty_string_returns_no_chunks` — empty input produces no chunks
+- `test_never_splits_a_sentence` — every chunk ends in `.`/`!`/`?`, never mid-sentence
+- `test_groups_multiple_short_sentences_into_one_chunk` — short sentences aren't split into needlessly many chunks
+- `test_splits_into_multiple_chunks_when_over_size` — long text is split
+- `test_oversized_single_sentence_becomes_its_own_chunk_instead_of_being_cut` — a sentence longer than the target size is kept whole, not truncated
+- `test_all_sentences_are_preserved_across_chunks` — no sentences are silently dropped

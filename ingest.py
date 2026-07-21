@@ -8,7 +8,7 @@ import pathlib
 import chromadb
 from chromadb.utils import embedding_functions
 
-from chunking import chunk_text
+from chunking import semantic_chunk_text
 
 CORPUS_DIR = pathlib.Path(__file__).parent / "corpus"
 DB_DIR = pathlib.Path(__file__).parent / "chroma_db"
@@ -36,7 +36,7 @@ def build_collection() -> chromadb.Collection:
     ids, documents, metadatas = [], [], []
     for path in sorted(CORPUS_DIR.glob("*.md")):
         text = path.read_text(encoding="utf-8")
-        for i, chunk in enumerate(chunk_text(text)):
+        for i, chunk in enumerate(semantic_chunk_text(text)):
             ids.append(f"{path.stem}::{i}")
             documents.append(chunk)
             # "status" enables metadata filtering (see rag.py's retrieve()) so a
