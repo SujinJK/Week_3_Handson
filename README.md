@@ -37,9 +37,10 @@ Claude.
 | `eval/eval_set.json` | 8 question -> expected-source pairs, used to measure retrieval quality. |
 | `eval/retrieval_eval.py` | Runs every question in the eval set through retrieval only (no Claude call, so it's free), comparing plain vector search hit@k against hit@k after reranking. |
 | `eval/generation_eval.py` | Runs the full pipeline (retrieve + generate) for every eval question, then uses a second Claude call as an LLM-as-judge to score faithfulness and citation accuracy. Costs a small amount of API credit — see "Evaluation metrics" below. |
+| `eval/voyage_comparison.py` | Compares local (`all-MiniLM-L6-v2`) vs. Voyage AI (`voyage-4`) embeddings on the same eval set — Anthropic's recommended embeddings provider vs. what this project actually uses. See "Voyage AI comparison" below. |
 | `tests/test_chunking.py` | Unit tests for the chunking logic (chunk boundaries, overlap, no data loss). |
-| `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`) / test deps (`pytest`). |
-| `.env.example` / `.env` | API key template / your real key (gitignored). |
+| `requirements.txt` / `requirements-dev.txt` | Runtime deps (`anthropic`, `chromadb`, `sentence-transformers`, `voyageai`) / test deps (`pytest`). |
+| `.env.example` / `.env` | API key template (`ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`) / your real keys (gitignored). |
 
 ## Setup
 
@@ -47,6 +48,11 @@ Claude.
 pip install -r requirements.txt
 cp .env.example .env   # then add your ANTHROPIC_API_KEY
 ```
+
+`VOYAGE_API_KEY` in `.env` is only needed for `eval/voyage_comparison.py` —
+everything else runs without it. Get a free key at
+[dashboard.voyageai.com](https://dashboard.voyageai.com) (see "Voyage AI
+comparison" below for cost and rate-limit details).
 
 **Windows note:** if `import torch` fails with `WinError 1114` (a DLL
 initialization error), your Visual C++ Redistributable is out of date —
@@ -62,6 +68,7 @@ python ingest.py          # build the vector store (run once, or whenever corpus
 python rag.py              # interactive Q&A loop
 python -m eval.retrieval_eval    # measure retrieval quality (free, no API calls)
 python -m eval.generation_eval   # measure answer faithfulness + citation accuracy (small API cost)
+python -m eval.voyage_comparison # compare local vs Voyage AI embeddings (needs VOYAGE_API_KEY)
 python failure_demos.py   # watch 3 real RAG failure modes happen live
 pytest                     # unit tests for chunking
 ```
@@ -92,10 +99,15 @@ pytest                     # unit tests for chunking
 - **The corpus is intentionally tiny** (5 docs, 10 chunks) — enough to prove
   the pipeline works and to run a fast eval loop, but not representative of
   retrieval quality at real scale.
-- **Embedding quality ceiling.** Local `all-MiniLM-L6-v2` performs well here
-  (8/8 on the eval) because the corpus is small and topically distinct.
-  Voyage AI (Anthropic's recommended embeddings provider) would generally do
-  better on a larger, more ambiguous corpus — worth comparing if this grows.
+- **Embedding quality ceiling.** Local `all-MiniLM-L6-v2` performs identically
+  to Voyage AI on this corpus's eval set (8/8 both — see "Voyage AI
+  comparison" below) because the corpus is small and topically distinct.
+  Voyage would likely pull ahead on a larger, more ambiguous corpus.
+- **Voyage's free tier is rate-limited without a card on file.** 3
+  requests/minute until you add a payment method (still free — the 200M
+  free tokens apply either way, it's a throughput cap, not a cost gate).
+  Batch multiple texts into one `embed()` call rather than looping — see
+  `eval/voyage_comparison.py`, which hit this limit before being fixed.
 - **Local environment note:** on this machine, dependencies are installed in
   a dedicated virtual environment at `C:\pyenvs\week3` (not the default
   Python) to work around a Windows path-length limit — see the Windows note
@@ -141,9 +153,10 @@ differently from the source text can still retrieve it.
   see "Evaluation metrics" below for a real case where it reordered the
   top result. Runs locally, same as embedding — no added API cost.
 - **Embedding model: `all-MiniLM-L6-v2`** (384 dimensions) — a small,
-  general-purpose local model. Fine for this corpus's size and topic
-  separation; a larger or more specialized corpus would likely benefit from
-  a stronger model (e.g. Voyage AI's models).
+  general-purpose local model. Scored identically to Anthropic's recommended
+  Voyage AI embeddings on this corpus's eval set (see "Voyage AI comparison"
+  below) — fine at this size and topic separation, though a larger or
+  messier corpus may show a real gap between them.
 - **`temperature` / `top_p` — not set, and not applicable here.** These are
   text-*generation* sampling knobs (how much randomness the model uses when
   writing its answer), unrelated to retrieval's `top_k`. They're easy to
@@ -249,7 +262,51 @@ faithfulness and citation-style checks the same way, plus more. We built
 our own here instead of adopting a framework, since a single-purpose judge
 prompt was enough for an 8-question eval set.
 
-## Challenges RAG systems face at scale (beyond what this project shows)
+## Voyage AI comparison
+
+Local `all-MiniLM-L6-v2` embeddings are free and require no account — but
+Voyage AI is Anthropic's recommended embeddings provider. This project
+started with local embeddings deliberately ("try local first, see if we
+need Voyage") and this is that follow-up.
+
+```
+python -m eval.voyage_comparison
+```
+
+**What it does differently from the rest of the pipeline:** it embeds
+corpus chunks and questions directly through the Voyage client rather than
+via Chroma's built-in `VoyageAIEmbeddingFunction`. Chroma binds one
+embedding function to a collection for both indexing and querying, but
+Voyage's `input_type` parameter ("document" vs. "query") is meant to differ
+between the two — using the wrapper would silently lose that distinction.
+Embedding both sides manually and passing precomputed vectors into an
+in-memory Chroma collection reproduces Voyage's recommended usage correctly.
+
+**Result: 8/8 (100%) for both**, identical to local embeddings — this
+corpus is too small and topically distinct for embedding quality to move
+hit@k either way. But composition wasn't identical: for "how long are files
+kept in Trash," Voyage independently promoted `product_faq.md` (the correct
+source) to the #1 slot, the exact same correction the cross-encoder reranker
+found on its own in "Evaluation metrics" above (local embeddings alone had
+ranked `refund_policy.md` first for that question). Two unrelated
+techniques converging on the same fix is a stronger signal that
+`refund_policy.md` genuinely sits closer to that question's wording than it
+should, than either finding alone would be.
+
+**A real gotcha, not a hypothetical one:** without a payment method on file,
+Voyage's free tier caps you at **3 requests per minute** (still free — the
+200M free tokens still apply, it's a throughput limit, not a cost gate).
+The first version of this script called `embed()` once per question in a
+loop and hit that limit immediately. The fix — batch all 8 questions into a
+single `embed()` call instead of 8 separate ones — is simply better practice
+regardless of the rate limit, and dropped the call count from 9 to 2 for the
+whole comparison (1 for the corpus, 1 for every question at once).
+
+**Why we didn't just switch to Voyage:** identical retrieval quality at
+zero measured benefit, for the cost of a second API key, an external
+account, and losing the "no signup required" simplicity of the local model.
+That calculus would flip on a larger or more ambiguous corpus — this
+comparison exists to make that a measured decision later, not a guess now.
 
 This project is small and clean on purpose, so it doesn't hit every
 challenge a production RAG system runs into. Worth knowing about even
@@ -401,6 +458,7 @@ describing the fix.
 | Semantic chunking | Splitting on sentence boundaries and grouping whole sentences up to a target size, instead of a fixed word count | `semantic_chunk_text()` in `chunking.py`, used by `ingest.py`; a chunk boundary only ever falls between sentences, never inside one — `failure_demos.py` demo 2 proves this holds even at a 15-word target far smaller than the sentence it must keep whole |
 | Reranking | A second-stage model that re-scores initial vector-search results, using a slower but more accurate method, before picking the final k | `rerank()` in `rag.py`, using a local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`); retrieves 8 candidates by vector distance, reranks to the final 3 — see "Evaluation metrics" for a real case where this reordered the top result |
 | Bi-encoder vs. cross-encoder | A bi-encoder embeds query and document separately, then compares vectors (fast, used for the initial wide retrieval); a cross-encoder reads both together and scores relevance directly (slower, more accurate, only practical over a small candidate pool) | `all-MiniLM-L6-v2` (bi-encoder, `ingest.py`/`rag.py`'s `retrieve()`) vs. `cross-encoder/ms-marco-MiniLM-L-6-v2` (`rag.py`'s `rerank()`) |
+| Asymmetric query/document embedding (`input_type`) | Embedding a search query and the documents it searches with different, retrieval-optimized settings, rather than treating both the same way | `voyageai.Client.embed(..., input_type="document")` at ingest vs. `input_type="query"` at search time, in `eval/voyage_comparison.py` — done by calling the Voyage client directly instead of Chroma's bound embedding-function wrapper, which only supports one `input_type` for both |
 
 **Standard RAG techniques we deliberately skipped** (see "What a production
 RAG system would add" and "Challenges RAG systems face at scale" above for
