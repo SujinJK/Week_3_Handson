@@ -1,33 +1,50 @@
 What the project does
-This is a simple RAG demo. It takes a small set of company documents, turns them into searchable pieces, and then answers questions by retrieving the most relevant pieces and asking Claude to write the answer using only those pieces.
+This is a RAG demo. It takes a small set of company documents, turns them into searchable pieces, and then answers questions by retrieving the most relevant pieces and asking Claude to write the answer using only those pieces. It started simple and grew a few real search-quality upgrades along the way.
 
 How it works
 1. ingest.py reads the markdown docs in corpus/.
-2. It splits each document into overlapping text chunks so no important sentence gets cut off.
-3. It embeds each chunk with a local embedding model (all-MiniLM-L6-v2) and stores those vectors in Chroma.
-4. rag.py embeds your question the same way, finds the top 3 closest chunks, and sends them to Claude with a prompt that says: answer only from these snippets and cite them.
-5. You get an answer plus the sources that were retrieved.
+2. It splits each document using semantic_chunk_text, which breaks on sentence boundaries so a chunk never cuts a fact in half mid-sentence.
+3. It embeds each chunk with a local embedding model (all-MiniLM-L6-v2) and stores those vectors in Chroma, tagged with a "status" field (current vs superseded).
+4. When you ask a question, rag.py does three retrieval steps instead of one:
+   a. Vector search: embeds your question, finds the top 8 closest chunks by meaning.
+   b. Keyword search: BM25 finds the top 8 chunks by exact word overlap (good for names, codes, acronyms embeddings can miss).
+   c. Fusion: combines both ranked lists (Reciprocal Rank Fusion) into one list.
+   d. Rerank: a local cross-encoder re-scores the fused list and keeps the best 3.
+5. Those 3 chunks go to Claude with a prompt that says: answer only from these snippets and cite them, or say you don't know.
+6. You get an answer plus every retrieval stage printed out, so you can see what got kept vs discarded.
 
 What libraries we use
-- sentence-transformers: makes local text embeddings.
+- sentence-transformers: local text embeddings + the cross-encoder reranker.
+- rank_bm25: local keyword search (BM25), no model download needed, pure math.
 - chromadb: stores embeddings and runs vector similarity search.
-- anthropic: calls Claude for the final answer.
-- python-dotenv: loads the API key from .env.
-- pytest: for testing the chunking function.
+- anthropic: calls Claude for the final answer (and to grade its own answers).
+- voyageai: Anthropic's recommended embeddings provider, used only for comparison.
+- python-dotenv: loads API keys from .env.
+- pytest: for testing the chunking functions.
 
 How we evaluate it
-- eval/retrieval_eval.py runs a set of 8 sample questions from eval/eval_set.json.
-- It checks whether the expected document appears in the top 3 retrieved chunks.
-- That metric is called hit@3.
-- Right now this project is only measuring retrieval quality, not the final generated answer quality.
+- eval/retrieval_eval.py: 8 sample questions, checks whether the expected document shows up in the top 3 — for plain vector search, hybrid (fused) search, and hybrid+reranked, side by side. All three score 8/8 on this small corpus.
+- eval/generation_eval.py: runs the real pipeline end to end, then asks Claude to grade its own answer for two things — did it stick to the retrieved context (faithful), and does every citation actually support its claim (citations_valid). Also 8/8 on both. This is the piece that used to be missing — we're no longer measuring retrieval quality alone.
+- eval/voyage_comparison.py: same 8 questions, but embedded with Voyage AI instead of the local model. Tied 8/8 — no measured benefit to switching on a corpus this small.
+- eval/query_transformation_comparison.py: tests HyDE (rewriting the question into a hypothetical answer before embedding it) on deliberately colloquial questions. This one made things WORSE (3/3 down to 2/3) because the rewritten passages invented specific wrong facts. Kept in the code, not turned on by default.
+- failure_demos.py: deliberately breaks the pipeline three ways to see real failure modes instead of just assuming them.
+
+What we tried that actually helped
+- Semantic chunking instead of fixed word-count chunking — stops a chunk from ever splitting a sentence in half, even at a tiny target size.
+- Metadata filtering (status = current vs superseded) — lets us exclude an outdated document from search entirely instead of hoping Claude notices the conflict.
+- Hybrid search + reranking — the best example is the single-word question "TOTP": plain vector search got the wrong document, BM25 alone got the right one, and even after fusing both, the final reranking step was what actually fixed the top result. Three techniques, three necessary layers.
+
+What we tried that didn't help
+- HyDE query rewriting hurt more than it helped here — the fabricated details in the rewritten "hypothetical answer" pointed retrieval at the wrong neighborhood. A real, honest negative result, not a bug.
 
 What the main challenges are
 - Keeping the index fresh: if the docs change, you must re-run ingest.py.
-- Chunking balance: chunks need to be big enough to keep meaning, but small enough to be specific.
-- Retrieval vs real answers: finding the right document is only part of the problem; Claude still has to answer correctly and cite it properly.
+- Chunking balance: chunks need to be big enough to keep meaning, but small enough to be specific — semantic chunking helps but doesn't remove the tradeoff entirely.
+- Retrieval vs real answers: finding the right document is only part of the problem; Claude still has to answer correctly and cite it properly, which is why we added the generation-quality eval.
 - Hallucinations: even with a strict prompt, the model can still make unsupported claims if the context is weak or retrieval is wrong.
-- No conversation memory: every question is treated separately.
-- Small corpus: this is a toy setup, so it works well here but is not a full production system.
+- Fusion isn't perfect: combining two ranked lists by rank position alone (RRF) can still get the top answer wrong if one list's results aren't actually relevant, even though they were the "closest available."
+- No conversation memory: every question is treated independently.
+- Small corpus: this is a small setup on purpose, so results here don't necessarily generalize to a bigger, messier document set.
 
 Simple summary
-This project is a clean demo of how a local retrieval layer can ground an LLM answer. The key idea is “search first, then generate,” and we validate the search step with a simple hit@3 test.
+This project is a working demo of a layered retrieval pipeline (semantic chunking, hybrid vector+keyword search, reranking, metadata filtering) that grounds an LLM's answer instead of letting it guess — plus honest evidence, not just claims, for what each layer actually contributes and where one technique (HyDE) genuinely didn't pay off.
