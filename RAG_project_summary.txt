@@ -1,0 +1,33 @@
+What the project does
+This is a simple RAG demo. It takes a small set of company documents, turns them into searchable pieces, and then answers questions by retrieving the most relevant pieces and asking Claude to write the answer using only those pieces.
+
+How it works
+1. ingest.py reads the markdown docs in corpus/.
+2. It splits each document into overlapping text chunks so no important sentence gets cut off.
+3. It embeds each chunk with a local embedding model (all-MiniLM-L6-v2) and stores those vectors in Chroma.
+4. rag.py embeds your question the same way, finds the top 3 closest chunks, and sends them to Claude with a prompt that says: answer only from these snippets and cite them.
+5. You get an answer plus the sources that were retrieved.
+
+What libraries we use
+- sentence-transformers: makes local text embeddings.
+- chromadb: stores embeddings and runs vector similarity search.
+- anthropic: calls Claude for the final answer.
+- python-dotenv: loads the API key from .env.
+- pytest: for testing the chunking function.
+
+How we evaluate it
+- eval/retrieval_eval.py runs a set of 8 sample questions from eval/eval_set.json.
+- It checks whether the expected document appears in the top 3 retrieved chunks.
+- That metric is called hit@3.
+- Right now this project is only measuring retrieval quality, not the final generated answer quality.
+
+What the main challenges are
+- Keeping the index fresh: if the docs change, you must re-run ingest.py.
+- Chunking balance: chunks need to be big enough to keep meaning, but small enough to be specific.
+- Retrieval vs real answers: finding the right document is only part of the problem; Claude still has to answer correctly and cite it properly.
+- Hallucinations: even with a strict prompt, the model can still make unsupported claims if the context is weak or retrieval is wrong.
+- No conversation memory: every question is treated separately.
+- Small corpus: this is a toy setup, so it works well here but is not a full production system.
+
+Simple summary
+This project is a clean demo of how a local retrieval layer can ground an LLM answer. The key idea is “search first, then generate,” and we validate the search step with a simple hit@3 test.

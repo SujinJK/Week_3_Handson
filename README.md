@@ -132,6 +132,15 @@ differently from the source text can still retrieve it.
   `claude-opus-4-8` (used in `rag.py`) doesn't accept them at all — Anthropic
   removed sampling parameters starting with the 4.6 model generation in
   favor of an `effort` level, which we also leave at its default.
+- **Metadata filtering: `where={"status": "current"}`.** Every chunk is
+  tagged `"status": "current"` at ingest time (`ingest.py`), and `retrieve()`
+  in `rag.py` filters on it *before* similarity ranking happens — a
+  non-current chunk is never a candidate, not just ranked lower. Every real
+  document is tagged `"current"`, so this is a no-op today (retrieval results
+  are identical with or without it). It exists so that if a document is ever
+  superseded, tagging it `"superseded"` excludes it from search immediately,
+  without deleting the file or touching the ingest pipeline. See "Failure
+  demos" below for this actually fixing the stale-document problem.
 
 **What a production RAG system would add that this one doesn't:**
 - **Reranking** — a second-stage model that re-scores the top ~20 vector
@@ -294,11 +303,24 @@ confirm with HR") instead of picking one — a much better outcome, but one
 that depends entirely on generation catching a problem retrieval should
 never have surfaced unresolved.
 
+**The fix: metadata filtering.** We tagged the stale handbook `"status":
+"superseded"` and re-ran k=1 with a `where={"status": "current"}` filter
+applied at query time. Result: retrieved `employee_handbook.md` (the current
+one) and answered *"Unused PTO carries over up to a maximum of 5 days...
+[1]"* — correct, because the stale chunk was never a candidate in the first
+place, not just outranked. This is the same mechanism from "Metadata
+filtering" above, now shown actually solving the problem it was added for.
+The catch: the fix is only as good as the tag behind it — something still
+has to mark a document `"superseded"` to begin with, which is a document
+lifecycle question, not something retrieval code can solve on its own.
+
 **The pattern across all three:** generation quality (a good system prompt,
 a capable model) can catch and soften some retrieval-layer problems, but it
 is a safety net, not a fix. The underlying issues — no relevance threshold,
 chunk boundaries splitting facts, no document lifecycle management — live in
-the retrieval layer and have to be solved there.
+the retrieval layer and have to be solved there. Metadata filtering is the
+one of these three we actually fixed at the retrieval layer instead of just
+describing the fix.
 
 ## Terminology: what we used vs. what we skipped
 
@@ -318,6 +340,7 @@ the retrieval layer and have to be solved there.
 | System prompt | The instruction that sets the model's behavior for the whole request | `SYSTEM_PROMPT` |
 | Hallucination (as a failure mode we test for) | The model answering from outside knowledge instead of the given context | tested by the "CEO's favorite language" case and `failure_demos.py` demo 1 |
 | Retrieval evaluation / hit@k | Measuring whether the right document was retrieved, separate from answer quality | `eval/retrieval_eval.py` |
+| Metadata filtering | Restricting *which* chunks a query searches over, using stored metadata, before similarity ranking happens | `where={"status": "current"}` in `retrieve()` (`rag.py`); every real chunk is tagged `"current"` so it's a no-op today — `failure_demos.py` demo 3 shows it actually excluding a stale document when one exists |
 
 **Standard RAG techniques we deliberately skipped** (see "What a production
 RAG system would add" and "Challenges RAG systems face at scale" above for
@@ -330,8 +353,7 @@ why each matters and when it'd be worth adding):
 | Query transformation / expansion / HyDE | Rewriting the question before embedding it to better match document phrasing | Questions in the eval set were already phrased close enough to the source text |
 | `temperature` / `top_p` | Generation-time randomness controls (unrelated to retrieval's `top_k`, despite the similar name) | Not accepted at all by `claude-opus-4-8` — Anthropic replaced them with `effort` on recent models |
 | Semantic chunking | Splitting on sentence/paragraph boundaries instead of a fixed word count | Fixed-size chunking with overlap was simpler and sufficient for this corpus; demo 2 in `failure_demos.py` shows exactly the failure semantic chunking would help avoid |
-| Metadata filtering | Restricting *which* chunks a query searches over, using stored metadata (e.g. `where={"source": "..."}` on Chroma's `query()`), instead of always searching the whole collection | We store metadata (`source`, `chunk_index`) but only use it for citations and eval comparisons — `retrieve()` in `rag.py` never passes a `where` clause, so every query searches all 10 chunks regardless of topic or document |
-| Access control / permission-filtered retrieval | Restricting which documents a given user's queries can retrieve | Single-user demo corpus with no real permission boundaries to enforce — this is the concrete use case metadata filtering (above) would implement, e.g. `where={"allowed_roles": {"$in": [user_role]}}` |
+| Access control / permission-filtered retrieval | Restricting which documents a given user's queries can retrieve, e.g. `where={"allowed_roles": {"$in": [user_role]}}` | Single-user demo corpus with no real permission boundaries to enforce — the same metadata-filtering mechanism now used for `status` (see "Used in this project" above) is exactly how this would be built; we just never added an `allowed_roles` tag because there's no second user to restrict |
 | Incremental indexing | Updating the vector store for changed documents only, instead of a full rebuild | `ingest.py` rebuilds from scratch every run — fine at 5 documents, not at scale |
 | Agentic / multi-hop RAG | The model deciding whether/what to retrieve, and issuing further retrievals based on what it finds | Every question here is answered in a single retrieve-then-generate pass |
 

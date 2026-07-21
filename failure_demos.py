@@ -27,9 +27,16 @@ CORPUS_DIR = Path(__file__).parent / "corpus"
 CONFLICT_CORPUS_DIR = Path(__file__).parent / "corpus_conflict_demo"
 
 
-def _build_temp_collection(corpus_dir: Path, chunk_size: int, overlap: int) -> tuple[chromadb.Collection, str]:
+def _build_temp_collection(
+    corpus_dir: Path, chunk_size: int, overlap: int, status_map: dict[str, str] | None = None
+) -> tuple[chromadb.Collection, str]:
     """Ingest a corpus into a fresh, disposable Chroma collection with custom
-    chunking parameters. Returns (collection, temp_dir) — caller must clean up temp_dir."""
+    chunking parameters. Returns (collection, temp_dir) — caller must clean up temp_dir.
+
+    status_map optionally overrides the "status" metadata for specific
+    filenames (e.g. {"employee_handbook_2023.md": "superseded"}); any file not
+    in the map defaults to "current", matching ingest.py's real behavior."""
+    status_map = status_map or {}
     temp_dir = tempfile.mkdtemp(prefix="rag_failure_demo_")
     client = chromadb.PersistentClient(path=temp_dir)
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
@@ -38,10 +45,11 @@ def _build_temp_collection(corpus_dir: Path, chunk_size: int, overlap: int) -> t
     ids, documents, metadatas = [], [], []
     for path in sorted(corpus_dir.glob("*.md")):
         text = path.read_text(encoding="utf-8")
+        status = status_map.get(path.name, "current")
         for i, chunk in enumerate(chunk_text(text, chunk_size=chunk_size, overlap=overlap)):
             ids.append(f"{path.stem}::{i}")
             documents.append(chunk)
-            metadatas.append({"source": path.name, "chunk_index": i})
+            metadatas.append({"source": path.name, "chunk_index": i, "status": status})
     collection.add(ids=ids, documents=documents, metadatas=metadatas)
     return collection, temp_dir
 
@@ -175,19 +183,26 @@ def demo_3_conflicting_sources_failure(client: anthropic.Anthropic) -> None:
 
     question = "How many days of PTO carry over into the next year?"
 
-    collection, temp_dir = _build_temp_collection(CONFLICT_CORPUS_DIR, chunk_size=120, overlap=30)
+    # File content alone doesn't mark either handbook as outdated -- that's
+    # realistic. The status tag below simulates knowing that out-of-band
+    # (e.g. from a document management system), which is exactly the piece
+    # metadata filtering needs in order to do anything.
+    status_map = {"employee_handbook_2023.md": "superseded"}
+    collection, temp_dir = _build_temp_collection(
+        CONFLICT_CORPUS_DIR, chunk_size=120, overlap=30, status_map=status_map
+    )
 
-    # k=1: only the single closest chunk. If the stale doc ranks closer than
-    # the current one, this silently returns the WRONG policy with full
-    # confidence — no conflict to flag, because the conflicting chunk was
-    # never retrieved in the first place.
+    # k=1, NO filter: if the stale doc ranks closer than the current one,
+    # this silently returns the WRONG policy with full confidence — no
+    # conflict to flag, because the conflicting chunk was never retrieved.
     top1 = collection.query(query_texts=[question], n_results=1)
     top1_source = top1["metadatas"][0][0]["source"]
     top1_context = f"[1] (source: {top1_source})\n{top1['documents'][0][0]}"
-    print(f"\n--- k=1 (only the single closest chunk) — retrieved: {top1_source} ---")
+    print(f"\n--- k=1, no filter — retrieved: {top1_source} ---")
     print(_ask(client, SYSTEM_PROMPT, top1_context, question))
 
-    # k=3: both versions likely appear, so the model can at least see the conflict.
+    # k=3, NO filter: both versions likely appear, so the model can at least
+    # see the conflict.
     hits = collection.query(query_texts=[question], n_results=3)
     context_hits = [
         {"text": text, "source": meta["source"]}
@@ -197,26 +212,39 @@ def demo_3_conflicting_sources_failure(client: anthropic.Anthropic) -> None:
         f"[{i+1}] (source: {h['source']})\n{h['text']}" for i, h in enumerate(context_hits)
     )
 
-    print("\n--- k=3 (both the current AND the stale handbook get retrieved) ---")
+    print("\n--- k=3, no filter — both the current AND the stale handbook get retrieved ---")
     for i, h in enumerate(context_hits, start=1):
         print(f"  [{i}] {h['source']}")
     print(_ask(client, SYSTEM_PROMPT, context, question))
+
+    # k=1, WITH metadata filtering (where={"status": "current"}): the stale
+    # chunk is excluded from the candidate pool before ranking even happens
+    # -- not outranked, not flagged, just never in the running.
+    filtered_top1 = collection.query(query_texts=[question], n_results=1, where={"status": "current"})
+    filtered_source = filtered_top1["metadatas"][0][0]["source"]
+    filtered_context = f"[1] (source: {filtered_source})\n{filtered_top1['documents'][0][0]}"
+    print(f"\n--- k=1, WITH filter (status=current) — retrieved: {filtered_source} ---")
+    print(_ask(client, SYSTEM_PROMPT, filtered_context, question))
 
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     print(
         "\n[Why this matters] Nothing in the file content marks "
         "employee_handbook_2023.md as outdated — a plausible real-world "
-        "accident (an old doc never removed from a shared drive). At k=1, "
-        "if the stale chunk happens to rank closer, the system returns a "
-        "confident, cleanly-cited, WRONG answer — the worst kind of failure, "
-        "because nothing about the response looks uncertain. At k=3 the model "
-        "can at least see both versions and flag the conflict instead of "
-        "picking one — better, but still relies on generation to notice what "
-        "retrieval should never have surfaced unresolved in the first place. "
-        "This is why production RAG systems need document lifecycle "
-        "management (versioning, expiry dates, deduplication) — retrieval "
-        "and generation quality alone can't fix a stale knowledge base.\n"
+        "accident (an old doc never removed from a shared drive). At k=1 with "
+        "no filter, if the stale chunk happens to rank closer, the system "
+        "returns a confident, cleanly-cited, WRONG answer — the worst kind of "
+        "failure, because nothing about the response looks uncertain. At k=3 "
+        "the model can at least see both versions and flag the conflict "
+        "instead of picking one — better, but still relies on generation to "
+        "notice what retrieval should never have surfaced unresolved. "
+        "Metadata filtering fixes it at the source: tagging the stale "
+        "document and excluding it with a `where` clause means it's never a "
+        "retrieval candidate at all, at any k — no reliance on generation "
+        "noticing anything. The catch is that filter is only as good as the "
+        "status tag behind it: something still has to mark a document "
+        "superseded in the first place, which is a document lifecycle "
+        "problem, not a retrieval-code problem.\n"
     )
 
 

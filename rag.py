@@ -41,9 +41,15 @@ def get_collection() -> chromadb.Collection:
     return client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
 
 
-def retrieve(collection: chromadb.Collection, question: str, k: int = 3) -> list[dict]:
-    """Return the k most relevant chunks as {text, source, chunk_index, distance}."""
-    results = collection.query(query_texts=[question], n_results=k)
+def retrieve(
+    collection: chromadb.Collection, question: str, k: int = 3, where: dict | None = None
+) -> list[dict]:
+    """Return the k most relevant chunks as {text, source, chunk_index, distance}.
+
+    `where` is a Chroma metadata filter (e.g. {"status": "current"}) applied
+    BEFORE similarity ranking -- chunks that don't match are never candidates,
+    not just ranked lower. Passing None searches the whole collection."""
+    results = collection.query(query_texts=[question], n_results=k, where=where)
     hits = []
     for text, meta, distance in zip(
         results["documents"][0], results["metadatas"][0], results["distances"][0]
@@ -70,7 +76,11 @@ def answer_question(client: anthropic.Anthropic, collection: chromadb.Collection
     """Run one full RAG turn for a single question: retrieve chunks, ask Claude to
     answer strictly from them, then print the answer alongside what was retrieved
     so a human can verify the citations against the actual source chunks."""
-    hits = retrieve(collection, question)
+    # Filters retrieval down to current documents only. Every real chunk is
+    # tagged "current" (see ingest.py), so this has no effect today -- it's
+    # here so a future superseded document is excluded by construction rather
+    # than relying on generation to notice the conflict after the fact.
+    hits = retrieve(collection, question, where={"status": "current"})
     context = build_context_block(hits)
 
     response = client.messages.create(

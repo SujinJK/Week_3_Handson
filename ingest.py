@@ -39,7 +39,11 @@ def build_collection() -> chromadb.Collection:
         for i, chunk in enumerate(chunk_text(text)):
             ids.append(f"{path.stem}::{i}")
             documents.append(chunk)
-            metadatas.append({"source": path.name, "chunk_index": i})
+            # "status" enables metadata filtering (see rag.py's retrieve()) so a
+            # superseded document could be excluded from search without deleting
+            # it. Every file in corpus/ is current, so this is a no-op today --
+            # failure_demos.py demo 3 shows it actually excluding a stale doc.
+            metadatas.append({"source": path.name, "chunk_index": i, "status": "current"})
 
     collection.add(ids=ids, documents=documents, metadatas=metadatas)
     return collection
